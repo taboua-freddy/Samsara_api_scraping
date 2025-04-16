@@ -1,4 +1,6 @@
 from datetime import datetime
+from enum import Enum
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -48,7 +50,18 @@ def get_metadata_by_table_names(metadata:pd.DataFrame, table_names: list[str]) -
     # metadata = make_meta_data("metadata.xlsx", start_time, end_time)
     return metadata[metadata["table"].isin(table_names)]
 
-def get_metadata(metadata:pd.DataFrame,table_names: list[str]=None, filter:str="all") -> pd.DataFrame:
+class TypeFilter(Enum):
+    EXCEPTION_DATE = "exception_date"
+    EXCEPTION_TABLE = "exception_table"
+    DATE_RANGE = "date_range"
+    VEHICLE_STATS = "vehicle_stats"
+    DOWNLOADABLE_ONESHOT = "downloadable_oneshot"
+    EXCEPTION = "exception"
+    EXCEPTION_DATE_ONLY_START_DATE = "exception_date_only_start_date"
+    ALL = "all"
+
+
+def get_metadata(metadata:pd.DataFrame,table_names: list[str]= None, filter: Optional[TypeFilter] = "all") -> pd.DataFrame:
     if table_names is not None:
         metadata = get_metadata_by_table_names(metadata, table_names)
     if filter == "exception_date":
@@ -324,17 +337,17 @@ def make_meta_data(metadata_filename: str, start_time: str, end_time: str, make_
             "is_exception": 0,
             "exception_config": {}
         },
-        {
-            "family": "fuel_energy",
-            "table": "fleet_drivers_fuel_energy",
-            "endpoint": "fleet/reports/drivers/fuel-energy",
-            "params": f"startDate={cast_date(start_time)},endDate={cast_date(end_time)}",
-            "is_processed": 0,
-            "rate_limit_per_seconde": 5,
-            "description": "Données de consommation de carburant et d'énergie pour tous les conducteurs dans la plage horaire spécifiée. Les données sont disponibles dans la plage horaire locale du conducteur.",
-            "is_exception": 1,
-            "exception_config": {"exception_type": "date", "constraint": "is_data_but_datetime"}
-        },
+        # {
+        #     "family": "fuel_energy",
+        #     "table": "fleet_drivers_fuel_energy",
+        #     "endpoint": "fleet/reports/drivers/fuel-energy",
+        #     "params": f"startDate={cast_date(start_time)},endDate={cast_date(end_time)}",
+        #     "is_processed": 0,
+        #     "rate_limit_per_seconde": 5,
+        #     "description": "Données de consommation de carburant et d'énergie pour tous les conducteurs dans la plage horaire spécifiée. Les données sont disponibles dans la plage horaire locale du conducteur.",
+        #     "is_exception": 1,
+        #     "exception_config": {"exception_type": "date", "constraint": "is_data_but_datetime"}
+        # },
         {
             "family": "fuel_energy",
             "table": "fleet_vehicles_fuel_energy",
@@ -344,7 +357,8 @@ def make_meta_data(metadata_filename: str, start_time: str, end_time: str, make_
             "rate_limit_per_seconde": 25,
             "description": "Données de consommation de carburant et d'énergie pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 1,
-            "exception_config": {"exception_type": "date", "constraint": "is_data_but_datetime"}
+            "exception_config": {"exception_type": "date", "constraint": "is_data_but_datetime"},
+            'delta_days': 1
         },
         {
             "family": "hours_of_service",
@@ -412,17 +426,17 @@ def make_meta_data(metadata_filename: str, start_time: str, end_time: str, make_
             "is_exception": 1,
             "exception_config": {"exception_type": "date", "constraint": "only_start_date"}
         },
-        {
-            "family": "safety",
-            "table": "fleet_safety_driver_efficiency",
-            "endpoint": "beta/fleet/drivers/efficiency",
-            "params": f"startTime={start_time},endTime={end_time}",
-            "is_processed": 0,
-            "rate_limit_per_seconde": 50,
-            "description": "Données d'efficacité des conducteurs.",
-            "is_exception": 0,
-            "exception_config": {}
-        },
+        # {
+        #     "family": "safety",
+        #     "table": "fleet_safety_driver_efficiency",
+        #     "endpoint": "beta/fleet/drivers/efficiency",
+        #     "params": f"startTime={start_time},endTime={end_time}",
+        #     "is_processed": 0,
+        #     "rate_limit_per_seconde": 50,
+        #     "description": "Données d'efficacité des conducteurs.",
+        #     "is_exception": 0,
+        #     "exception_config": {}
+        # },
         {
             "family": "safety",
             "table": "fleet_vehicle_safety_score",
@@ -644,18 +658,18 @@ def make_meta_data(metadata_filename: str, start_time: str, end_time: str, make_
             "is_exception": 0,
             "exception_config": {}
         },
-        {
-            "family": "safety",
-            "table": "fleet_drivers_efficiency",
-            "endpoint": "beta/fleet/drivers/efficiency",
-            "params": "driverIds={driverIds},"+f"startTime={start_time},endTime={end_time}",
-            "is_processed": 0,
-            "rate_limit_per_seconde": 50,
-            "description": "Données d'efficacité des conducteurs.",
-            "is_exception": 1,
-            "exception_config": {"table_name": "fleet_drivers", "table_column_name": "id",
-                                 "exception_param_name": "driverIds", "key_to_apply_on": "params", "is_list": 1}
-        }
+        # {
+        #     "family": "safety",
+        #     "table": "fleet_drivers_efficiency",
+        #     "endpoint": "beta/fleet/drivers/efficiency",
+        #     "params": "driverIds={driverIds},"+f"startTime={start_time},endTime={end_time}",
+        #     "is_processed": 0,
+        #     "rate_limit_per_seconde": 50,
+        #     "description": "Données d'efficacité des conducteurs.",
+        #     "is_exception": 1,
+        #     "exception_config": {"table_name": "fleet_drivers", "table_column_name": "id",
+        #                          "exception_param_name": "driverIds", "key_to_apply_on": "params", "is_list": 1}
+        # }
     ]
     df = pd.DataFrame(data)
     if make_file:

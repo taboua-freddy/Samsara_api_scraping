@@ -5,6 +5,7 @@ from typing import Literal
 import pytz
 
 from .gcp import GCSClient
+from .logs import MyLogger
 from .samsara import SamsaraClient
 from .utils import flatten_data, parquet_buffer, seconds_to_minutes, DATA_DIR, parallelize_execution, \
     get_start_end_date_config, date_to_iso_or_timestamp, process_params, timestamp_ms_to_timestamp, \
@@ -12,10 +13,7 @@ from .utils import flatten_data, parquet_buffer, seconds_to_minutes, DATA_DIR, p
 import pandas as pd
 from datetime import datetime, timedelta
 
-def json_normalize(df: pd.DataFrame, record_path: str, sep: str='_', meta: list[str]=None)->pd.DataFrame:
-    series = df[record_path]
-    df_normalized = pd.json_normalize(series, sep=sep)
-    return pd.concat([df, df_normalized], axis=1)
+from .utils_transformation import *
 
 
 class DataFetcher:
@@ -268,8 +266,7 @@ class DataFetcher:
 
         if start_end_config.get("type") == "timestamp_ms":
             try:
-                start_time = datetime.fromtimestamp(timestamp_ms_to_timestamp(float(start_time)),
-                                                    tz=pytz.UTC).isoformat()
+                start_time = datetime.fromtimestamp(timestamp_ms_to_timestamp(float(start_time)),tz=pytz.UTC).isoformat()
                 end_time = datetime.fromtimestamp(timestamp_ms_to_timestamp(float(end_time)), tz=pytz.UTC).isoformat()
             except Exception as e:
                 self.logger.error(f"Erreur lors de la conversion des dates en timestamp: {e}")
@@ -335,70 +332,77 @@ class DataFetcher:
         else:
             self.logger.info(f"Aucune donnée pour le {date_str} de la table {self.endpoint_info.get('table_name')}")
 
-def to_datetime(df: pd.DataFrame, columns: list[str], format=None)->pd.DataFrame:
-    for column in columns:
-        df[column] = pd.to_datetime(df[column], format=format)
-    return df
 
 class TransformData:
     def __init__(self):
         self.df = None
         self.endpoint_info = None
+        self.logger = MyLogger("TransformData")
 
-    def set_data(self, data: pd.DataFrame, endpoint_info: dict):
+    def set_data(self, data: pd.DataFrame, endpoint_info: dict) -> "TransformData":
+        """
+        Définit les données à transformer et les informations de l'endpoint
+        :param data:
+        :param endpoint_info:
+        :return: self
+        """
         self.df = data
         self.endpoint_info = endpoint_info
         return self
-    def _get_transform_config(self):
+    def _get_transform_config(self) -> dict:
+        """
+        Récupère la configuration de transformation pour les données
+        :return: dict
+        """
+        table_name = self.endpoint_info.get('table_name')
+        value = None
+        if table_name == "fleet_vehicles_fuel_energy":
+            params = self.endpoint_info.get('params')
+            if params:
+                params = process_params(params)
+                value = params.get("startDate")
+
         configs = {
-            "fleet_vehicle_stats_evBatteryStateOfHealthMilliPercent": {
+            "fleet_vehicle_stats_evAverageBatteryTemperatureMilliCelsius": get_standard_transformation_config("evAverageBatteryTemperatureMilliCelsius"),
+            "fleet_vehicle_stats_evBatteryStateOfHealthMilliPercent": get_standard_transformation_config("evBatteryStateOfHealthMilliPercent"),
+            "fleet_vehicle_stats_evChargingCurrentMilliAmp": get_standard_transformation_config("evChargingCurrentMilliAmp"),
+            "fleet_vehicle_stats_evChargingEnergyMicroWh": get_standard_transformation_config("evChargingEnergyMicroWh"),
+            "fleet_vehicle_stats_evChargingStatus": get_standard_transformation_config("evChargingStatus"),
+            "fleet_vehicle_stats_evChargingVoltageMilliVolt": get_standard_transformation_config("evChargingVoltageMilliVolt"),
+            "fleet_vehicle_stats_evConsumedEnergyMicroWh": get_standard_transformation_config("evConsumedEnergyMicroWh"),
+            "fleet_vehicle_stats_evDistanceDrivenMeters": get_standard_transformation_config("evDistanceDrivenMeters"),
+            "fleet_vehicle_stats_evRegeneratedEnergyMicroWh": get_standard_transformation_config("evRegeneratedEnergyMicroWh"),
+            "fleet_vehicle_stats_evStateOfChargeMilliPercent": get_standard_transformation_config("evStateOfChargeMilliPercent"),
+            "fleet_vehicles_fuel_energy": {
                 1: {
-                    "type_function": "is_df_function",
-                    "function": "explode",
-                    "kwargs": {"column": "evBatteryStateOfHealthMilliPercent"},
-                },
-                2: {
-                    "column_name": "evBatteryStateOfHealthMilliPercent",
                     "type_function": "is_custom_function",
-                    "function": "json_normalize",
-                    "kwargs": {"sep": "_", "record_path": "evBatteryStateOfHealthMilliPercent"},
+                    "function": "set_column",
+                    "kwargs": {"col_name": "time", "value": f"{value}"},
                 },
-                3: {
-                    "type_function": "is_df_function",
-                    "function": "drop",
-                    "kwargs": {"columns": ["evBatteryStateOfHealthMilliPercent"], "errors": "ignore"},
-                },
-                4: {
-                    "type_function": "is_df_function",
-                    "function": "rename",
-                    "kwargs": {"columns": {"value": "evBatteryStateOfHealthMilliPercent"}},
-                },
-                5: {
-                    "type_function": "is_df_function",
-                    "function": "drop_duplicates",
-                }
-                # 5: {
-                #     "type_function": "is_custom_function",
-                #     "function": "to_datetime",
-                #     "kwargs": {"columns": ["time"], "format": "%Y-%m-%dT%H:%M:%S.%fZ"},
-                # },
             },
         }
-        table_name = self.endpoint_info.get('table_name')
+
         return configs.get(table_name, {})
 
-    def transform(self):
+    def transform(self) -> pd.DataFrame:
+        """
+        Applique les transformations définies dans la configuration sur le DataFrame
+        :return:
+        """
         config = self._get_transform_config()
-        for step, step_config in config.items():
-            function_name = step_config.get("function")
-            if step_config.get("type_function") == "is_df_function":
-                function = getattr(self.df, function_name)
-                self.df = function(**step_config.get("kwargs", {}))
-            elif step_config.get("type_function") == "is_pd_function":
-                function = getattr(pd, function_name)
-                self.df = function(self.df, **step_config.get("kwargs"))
-            elif step_config.get("type_function") == "is_custom_function":
-                function = globals().get(function_name)
-                self.df = function(self.df, **step_config.get("kwargs", {}))
+        try:
+            for step, step_config in config.items():
+                function_name = step_config.get("function")
+                if step_config.get("type_function") == "is_df_function":
+                    function = getattr(self.df, function_name)
+                    self.df = function(**step_config.get("kwargs", {}))
+                elif step_config.get("type_function") == "is_pd_function":
+                    function = getattr(pd, function_name)
+                    self.df = function(self.df, **step_config.get("kwargs"))
+                elif step_config.get("type_function") == "is_custom_function":
+                    function = globals().get(function_name)
+                    self.df = function(self.df, **step_config.get("kwargs", {}))
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la transformation des données: {e}")
         return self.df
 

@@ -32,10 +32,10 @@ gcs_bucket_name = os.getenv('GCS_BUCKET_FLATTENED_NAME')
 database_id = os.getenv('DWH_ID')
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(CREDENTIALS_DIR, os.getenv("GCP_CREDENTIALS_FILE_NAME"))
 
-def upload_missing_files(start_date: str, end_date: str, max_workers:int = None):
-    samsara_api_token = os.getenv('SAMSARA_API_TOKEN')
-    gcs_bucket_name = os.getenv('GCS_BUCKET_NAME')
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(CREDENTIALS_DIR, os.getenv("GCP_CREDENTIALS_FILE_NAME"))
+def upload_missing_files(tables_names:list[str], start_date: str, end_date: str, max_workers:int = None):
+    # samsara_api_token = os.getenv('SAMSARA_API_TOKEN')
+    # gcs_bucket_name = os.getenv('GCS_BUCKET_NAME')
+    # os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(CREDENTIALS_DIR, os.getenv("GCP_CREDENTIALS_FILE_NAME"))
 
     rate_limiter = EndpointRateLimiter()
 
@@ -45,15 +45,19 @@ def upload_missing_files(start_date: str, end_date: str, max_workers:int = None)
     gcs_client = GCSClient(bucket_name=gcs_bucket_name)
 
     missing_files = gcs_client.bucket_manager.missing_files(
+        tables_names=tables_names,
         start_date=datetime.strptime(start_date, "%d/%m/%Y"),
         end_date=datetime.strptime(end_date, "%d/%m/%Y")
     )
     tasks = []
+
     for table_name, dates in missing_files.items():
         for date in dates:
             start_date = date.strftime("%d/%m/%Y")
             end_date = (date + pd.DateOffset(days=1)).strftime("%d/%m/%Y")
-            metadata = get_metadata_by_table_names([table_name], start_date, end_date)
+            all_metadata = make_meta_data("metadata.xlsx", start_date, end_date)
+            metadata = get_metadata(all_metadata, [table_name])
+            # metadata = get_metadata_by_table_names([table_name], start_date, end_date)
 
             for index, row in metadata.iterrows():
                 endpoint_info = row.to_dict()
@@ -153,15 +157,14 @@ if __name__ == '__main__':
     start_date = args.start_date
     end_date = args.end_date
     table_file_path = args.table_file_path
-    if table_file_path is not None:
-        if table_file_path == "ALL":
-            table_names = None
-        else:
-            table_names = open(table_file_path, "r").read().split("\n")
+
+    if table_file_path == "ALL":
+        table_names = None
+    elif table_file_path is not None and os.path.isfile(table_file_path):
+        df = pd.read_excel(table_file_path)
+        table_names = df.iloc[:, 0].tolist()
     else:
-        print("Veuillez spécifier le chemin du fichier contenant les noms des tables à traiter")
-        parser.print_help()
-        exit(1)
+        table_names = []
 
     gcs_client = GCSClient(bucket_name=gcs_bucket_name)
     if end_date is None:
@@ -177,13 +180,6 @@ if __name__ == '__main__':
             start_date = "01/01/2021"
 
     max_workers = args.max_workers
-    if table_names is not None:
-        if not os.path.isfile(table_file_path):
-            print("Le fichier spécifié contenant le nom des tables n'existe pas")
-            exit(1)
-        else:
-            df = pd.read_excel(table_file_path)
-            table_names = df.iloc[:, 0].tolist()
 
     dates = [
         {"start_date": start_date, "end_date": end_date},
@@ -211,7 +207,7 @@ if __name__ == '__main__':
         standard_logger.info(f"Temps d'exécution exception '{filter}': {td} secondes pour la période '{start_date}' - '{end_date}'")
         print(f"Temps d'exécution exception '{filter}': {td} secondes pour la période '{start_date}' - '{end_date}'")
 
-    upload_missing_files(start_date, end_date, max_workers)
+    upload_missing_files(table_names, start_date, end_date, max_workers)
 
     load_to_bigquery(table_names=table_names, last_update_str_date=start_date)
 

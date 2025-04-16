@@ -137,7 +137,7 @@ class BucketManager:
         blob.download_to_filename(destination_file_name)
         self.logger.info(f"Fichier {source_blob_name} téléchargé dans {destination_file_name}.")
 
-    def missing_files(self, start_date: datetime, end_date: datetime) -> dict[str, list[datetime]]:
+    def missing_files(self, tables_names:list[str], start_date: datetime, end_date: datetime) -> dict[str, list[datetime]]:
         """Vérifie si des fichiers sont manquants dans le bucket."""
         # Récupérer les fichiers Parquet déjà présents dans le bucket
         files = self.list_parquet_files()
@@ -147,7 +147,7 @@ class BucketManager:
         for file_path in files:
             table_name = self.get_table_name(file_path)
             file_name = file_path.split("/")[-1]
-            if date_range := extract_date_range(file_name):
+            if table_name in tables_names and (date_range := extract_date_range(file_name)):
                 if len(date_range) == 1:
                     current_dates[table_name].append(date_range[0])
                 else:
@@ -252,7 +252,8 @@ class GCSClient:
         blob_exists, blob = self.bucket_manager.file_exists(blob_name)
         if not blob_exists:
             self.bucket_manager.logger.error(f"Le fichier de configuration est introuvable dans le bucket.")
-            raise FileNotFoundError(f"Le fichier de configuration est introuvable dans le bucket.")
+            # raise FileNotFoundError(f"Le fichier de configuration est introuvable dans le bucket.")
+            return {}
         return json.loads(blob.download_as_string())
 
     def update_config(self, data: dict, erase=False) -> None:

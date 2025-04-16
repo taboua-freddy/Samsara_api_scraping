@@ -20,8 +20,8 @@ Ce projet vise à collecter des données depuis l'API Samsara, les stocker sur G
 ### Installation des dépendances
 1. Cloner le dépôt :
    ```bash
-   git clone <url_du_depot>
-   cd <nom_du_dossier>
+   git clone https://github.com/taboua-freddy/Samsara_api_scraping.git
+   cd Samsara_api_scraping
    ```
 2. Créer et activer un environnement virtuel :
    ```bash
