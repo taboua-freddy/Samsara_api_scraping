@@ -3,12 +3,14 @@ import os
 import re
 from datetime import datetime, timedelta
 
+import pandas as pd
 from google.cloud import storage, bigquery
 from google.cloud.exceptions import NotFound
 from io import BytesIO
 from collections import defaultdict
 
 from .logs import MyLogger
+from .metadata import get_metadata, TypeFilter
 
 from .utils import make_path, parallelize_execution, extract_date_range
 
@@ -23,8 +25,8 @@ class BucketManager:
         parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.tmp_folder = make_path(os.path.join(parent_dir, "resources", "tmp"))
         self.folder_pattern = r"/([^/]+)/\1_(\d{4}_\d{2}_\d{2})(?:_to_(\d{4}_\d{2}_\d{2}))?(?:_(\d+))?\.parquet"
-        self.gcs_log_path = os.path.join("resources", "logs")
-        self.gcs_config_path = os.path.join("resources", "config")
+        self.gcs_log_path = "resources/logs" #os.path.join("resources", "logs")
+        self.gcs_config_path = "resources/configs" #os.path.join("resources", "configs")
 
     def delete_file(self, blob_name: str) -> None:
         """
@@ -63,14 +65,18 @@ class BucketManager:
             index += 1
 
         return unique_name
-    def upload_bytes(self, buffer: BytesIO, destination_blob_name: str) -> None:
+    def upload_bytes(self, buffer: BytesIO, destination_blob_name: str, allow_unique_name: bool = False, delete_if_exists=False) -> None:
         """
         Télécharge les données dans un bucket GCS à partir d'un buffer.
         :param buffer: buffer contenant les données
         :param destination_blob_name: chemin du blob de destination
         :return: None
         """
-        destination_blob_name = self.get_unique_blob_name(destination_blob_name)
+        if delete_if_exists:
+            self.delete_file(destination_blob_name)
+            self.logger.info(f"Fichier {destination_blob_name} existe déjà, il a été supprimé avant le téléchargement.")
+        if allow_unique_name:
+            destination_blob_name = self.get_unique_blob_name(destination_blob_name)
         self.logger.info(f"Téléchargement des données vers gs://{self.bucket_name}/{destination_blob_name}")
         blob: storage.blob.Blob = self.bucket.blob(destination_blob_name)
         blob.upload_from_file(
@@ -83,7 +89,7 @@ class BucketManager:
         """Lister les fichiers Parquet dans le bucket GCS."""
         self.logger.info(f"Listing Parquet files in bucket: {self.bucket_name}")
         files = [blob.name for blob in self.bucket.list_blobs() if blob.name.endswith(".parquet")]
-        self.logger.debug(f"Found files: {files[:5]}.........")
+        self.logger.debug(f"Found files: {len(files)}.........")
         return files
 
     def get_table_name(self, file_path: str) -> str:
@@ -137,9 +143,12 @@ class BucketManager:
         blob.download_to_filename(destination_file_name)
         self.logger.info(f"Fichier {source_blob_name} téléchargé dans {destination_file_name}.")
 
-    def missing_files(self, tables_names:list[str], start_date: datetime, end_date: datetime) -> dict[str, list[datetime]]:
+    def missing_files(self, configs_for_update: dict, table_names: list[str], end_date: datetime, start_date: datetime | None = None) -> dict[str, list[datetime]]:
         """Vérifie si des fichiers sont manquants dans le bucket."""
         # Récupérer les fichiers Parquet déjà présents dans le bucket
+        if start_date is None:
+            start_date = datetime.strptime("2021-01-01", "%Y-%m-%d")
+
         files = self.list_parquet_files()
         # Grouper les fichiers par table (en fonction du chemin)
         current_dates = defaultdict(list)
@@ -147,7 +156,7 @@ class BucketManager:
         for file_path in files:
             table_name = self.get_table_name(file_path)
             file_name = file_path.split("/")[-1]
-            if table_name in tables_names and (date_range := extract_date_range(file_name)):
+            if table_name in table_names and (date_range := extract_date_range(file_name)):
                 if len(date_range) == 1:
                     current_dates[table_name].append(date_range[0])
                 else:
@@ -159,6 +168,11 @@ class BucketManager:
         for table_name, dates in current_dates.items():
             if len(dates) == 1:
                 continue
+
+            if config_for_update := configs_for_update.get(table_name, {}):
+                start_date = config_for_update.get("last_update_time", start_date)
+                start_date = datetime.strptime(start_date, "%d/%m/%Y") if isinstance(start_date, str) else start_date
+
             for date in [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]:
                 if date not in dates:
                     missing_dates[table_name].append(date)
@@ -221,7 +235,7 @@ class GCSClient:
     def __init__(self, bucket_name: str):
         self.bucket_manager = BucketManager(bucket_name)
 
-    def upload_bytes(self, buffer: BytesIO, destination_blob_name: str) -> None:
+    def upload_bytes(self, buffer: BytesIO, destination_blob_name: str, allow_unique_name: bool = False) -> None:
         """
         Télécharge les données dans un bucket GCS à partir d'un buffer.
         :param buffer: buffer contenant les données
@@ -229,11 +243,11 @@ class GCSClient:
         :return: None
         """
         try:
-            self.bucket_manager.upload_bytes(buffer, destination_blob_name)
+            self.bucket_manager.upload_bytes(buffer, destination_blob_name, allow_unique_name)
         except Exception as e:
             self.bucket_manager.logger.error(f"erreur lors de la migration des données vers GCS: {e}")
 
-    def upload_dict(self, data: dict, destination_blob_name: str) -> None:
+    def _upload_dict(self, data: dict, destination_blob_name: str) -> None:
         """
         Télécharge les données dans un bucket GCS à partir d'un buffer.
         :param data: Données à télécharger
@@ -243,12 +257,12 @@ class GCSClient:
         buffer = BytesIO(json.dumps(data, indent=4).encode())
         self.upload_bytes(buffer, destination_blob_name)
 
-    def get_config(self) -> dict:
+    def _get_config(self, filename: str) -> dict:
         """
         Télécharge les configurations à partir d'un fichier JSON dans un bucket GCS.
         :return: Dictionnaire de configurations
         """
-        blob_name = f"{self.bucket_manager.gcs_config_path}/config.json"
+        blob_name = f"{self.bucket_manager.gcs_config_path}/{filename}.json"
         blob_exists, blob = self.bucket_manager.file_exists(blob_name)
         if not blob_exists:
             self.bucket_manager.logger.error(f"Le fichier de configuration est introuvable dans le bucket.")
@@ -256,19 +270,42 @@ class GCSClient:
             return {}
         return json.loads(blob.download_as_string())
 
-    def update_config(self, data: dict, erase=False) -> None:
+    def get_configs_for_update(self) -> dict:
+        """
+        configs_for_update = {
+            "fleet_devices": {
+                "download_type": "one_shot",
+            },
+            "fleet_vehicles_fuel_energy": {
+                "download_type": "time",
+                "last_update_date": start_date
+            },
+        }
+        """
+        return self._get_config("configs_for_update")
+
+    def _update_config(self, data: dict, filename: str, erase=False) -> None:
         """
         Met à jour les configurations dans un fichier JSON dans un bucket GCS.
         :param data: Dictionnaire de configurations
         :param erase: Effacer les configurations existantes
         :return: None
         """
-        blob_name = f"{self.bucket_manager.gcs_config_path}/config.json"
+        blob_name = f"{self.bucket_manager.gcs_config_path}/{filename}.json"
         if not erase:
-            config = self.get_config()
+            config = self.get_configs_for_update()
             config.update(data)
         self.bucket_manager.delete_file(blob_name)
-        self.upload_dict(data, blob_name)
+        self._upload_dict(data, blob_name)
+
+    def update_configs_for_update(self, metadata: pd.DataFrame, end_time: str) -> None:
+        data = defaultdict(dict)
+        for _, row in metadata.iterrows():
+            data[row.get("table_name")].update({
+                "download_type": row.get("download_type", "time"),
+                "last_update_time": end_time
+            })
+        self._update_config(data, "configs_for_update", erase=False)
 
 class GCSBigQueryLoader:
     def __init__(self, bucket_name: str, dataset_id: str, **kwargs):
@@ -279,24 +316,32 @@ class GCSBigQueryLoader:
         self.bigquery_manager: BigQueryManager = BigQueryManager(dataset_id)
         # Configurer le logger
         self.logger: MyLogger = MyLogger("GCSBigQueryLoader", with_console=False)
-        self.table_names : list[str]|None = kwargs.get("table_names", None)
         self._from = kwargs.get("_from", None)
         self._to = kwargs.get("_to", None)
         self.max_workers = 2
 
-    def run(self):
+    def run(self, configs_for_update: dict, table_names: list[str] | None = None) -> None:
         """Exécuter le processus de chargement pour tous les fichiers Parquet."""
         files = self.bucket_manager.list_parquet_files()
         # Grouper les fichiers par table (en fonction du chemin)
         table_to_paths = defaultdict(list)
         for file_path in files:
             table_name = self.bucket_manager.get_table_name(file_path)
-            if self.table_names and table_name not in self.table_names:
+            if table_names and table_name not in table_names:
                 continue
+            start_date = self.bucket_manager.get_start_date(file_path)
             if self._from:
-                start_date = self.bucket_manager.get_start_date(file_path)
                 if start_date and start_date < self._from:
                     continue
+            if self._to:
+                end_date = self.bucket_manager.get_end_date(file_path)
+                if end_date and end_date > self._to:
+                    continue
+            if configs := configs_for_update.get(table_name, {}):
+                if last_update_time := configs.get("last_update_time"):
+                    last_update_date = datetime.strptime(last_update_time, "%d/%m/%Y")
+                    if start_date < last_update_date:
+                        continue
 
             table_to_paths[table_name].append(file_path)
             # folder_path = "/".join(file_path.split("/")[:-1])  # Extraire le chemin sans le fichier
@@ -305,6 +350,9 @@ class GCSBigQueryLoader:
         # tasks = [{'uri': set(uris), 'table_name': table_name} for table_name, uris in table_to_paths.items()]
         tasks = []
         for table_name, file_paths in table_to_paths.items():
+            if configs := configs_for_update.get(table_name, {}):
+                if configs.get("download_type", None) == "oneshot":
+                    self.bigquery_manager.bigquery_client.delete_table(table_name, not_found_ok=True)
             # si supérieur à 100 fichiers, on suppose qu'il ne s'agit pas d'une MAJ mais d'une première insertion donc on regroupe par dossier
             if len(file_paths) > 50:
                 file_path = file_paths[0]

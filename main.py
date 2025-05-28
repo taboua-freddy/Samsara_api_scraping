@@ -8,7 +8,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import argparse
 
-from modules.metadata import get_metadata
+from modules.metadata import get_metadata, build_metadata
 from modules.utils import CREDENTIALS_DIR, parquet_buffer, get_start_end_date_config, process_params, DATA_DIR, \
     LOGS_DIR, file_buffer
 from modules.raters import MemoryAccess
@@ -32,7 +32,7 @@ gcs_bucket_name = os.getenv('GCS_BUCKET_FLATTENED_NAME')
 database_id = os.getenv('DWH_ID')
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(CREDENTIALS_DIR, os.getenv("GCP_CREDENTIALS_FILE_NAME"))
 
-def upload_missing_files(tables_names:list[str], start_date: str, end_date: str, max_workers:int = None):
+def download_missing_files(configs_for_update:dict, tables_names:list[str], start_date: str, end_date: str, max_workers:int = None):
     # samsara_api_token = os.getenv('SAMSARA_API_TOKEN')
     # gcs_bucket_name = os.getenv('GCS_BUCKET_NAME')
     # os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(CREDENTIALS_DIR, os.getenv("GCP_CREDENTIALS_FILE_NAME"))
@@ -45,6 +45,7 @@ def upload_missing_files(tables_names:list[str], start_date: str, end_date: str,
     gcs_client = GCSClient(bucket_name=gcs_bucket_name)
 
     missing_files = gcs_client.bucket_manager.missing_files(
+        configs_for_update=configs_for_update,
         tables_names=tables_names,
         start_date=datetime.strptime(start_date, "%d/%m/%Y"),
         end_date=datetime.strptime(end_date, "%d/%m/%Y")
@@ -55,8 +56,8 @@ def upload_missing_files(tables_names:list[str], start_date: str, end_date: str,
         for date in dates:
             start_date = date.strftime("%d/%m/%Y")
             end_date = (date + pd.DateOffset(days=1)).strftime("%d/%m/%Y")
-            all_metadata = make_meta_data("metadata.xlsx", start_date, end_date)
-            metadata = get_metadata(all_metadata, [table_name])
+            all_metadata = make_meta_data(start_date, end_date)
+            metadata = get_metadata(all_metadata, table_names=[table_name])
             # metadata = get_metadata_by_table_names([table_name], start_date, end_date)
 
             for index, row in metadata.iterrows():
@@ -68,12 +69,7 @@ def upload_missing_files(tables_names:list[str], start_date: str, end_date: str,
     parallelize_execution(tasks=tasks, func="fetch_and_upload", logger=standard_logger, max_workers=max_workers)
 
 
-def scrape_samsara_to_gcs(start_date: str, end_date: str, iteration: int, is_exception=False, filter="all", table_names:list[str]=None, max_workers:int = None):
-
-
-    # Données de métadonnées pour les endpoints
-    metadata = make_meta_data("metadata.xlsx", start_date, end_date)
-    metadata = get_metadata(metadata, table_names, filter)
+def scrape_samsara_to_gcs(metadata: pd.DataFrame, is_exception: bool = False, iteration: int = 0, max_workers:int = None):
 
     # Initialisation du rate limiter global et par endpoint
     rate_limiter = EndpointRateLimiter()
@@ -123,18 +119,11 @@ def scrape_samsara_to_gcs(start_date: str, end_date: str, iteration: int, is_exc
     parallelize_execution(tasks=tasks, func="fetch_and_upload", logger=standard_logger, max_workers=max_workers)
 
 
-def load_to_bigquery(table_names=None, last_update_str_date: str|None = None):
-    def get_last_update_date(last_update_str_date: str|None):
-        if last_update_str_date is not None:
-            return datetime.strptime(last_update_str_date, "%d/%m/%Y")
-        return datetime.now()
-
+def load_to_bigquery(configs_for_update: dict, table_names=None):
     GCSBigQueryLoader(
         bucket_name=gcs_bucket_name,
-        dataset_id=database_id,
-        table_names=table_names,
-        _from=get_last_update_date(last_update_str_date)
-    ).run()
+        dataset_id=database_id
+    ).run(configs_for_update=configs_for_update, table_names=table_names)
 
 
 def upload_logs():
@@ -158,59 +147,78 @@ if __name__ == '__main__':
     end_date = args.end_date
     table_file_path = args.table_file_path
 
+    start_date = "01/02/2024"
+    end_date = "02/02/2024"
+
+    if end_date is None:
+        end_date = datetime.now().strftime("%d/%m/%Y")
+
+    if start_date is None:
+        start_date = "01/01/2021"
+
     if table_file_path == "ALL":
-        table_names = None
+        table_names = make_meta_data("01/01/2021", "01/01/2025")['table'].tolist()
     elif table_file_path is not None and os.path.isfile(table_file_path):
         df = pd.read_excel(table_file_path)
         table_names = df.iloc[:, 0].tolist()
     else:
-        table_names = []
+        table_names = [
+            "fleet_devices"
+            "fleet_vehicles",
+            "fleet_vehicle_stats_evStateOfChargeMilliPercent",
+            "fleet_vehicle_stats_obdEngineSeconds",
+            # "fleet_safety_events",
+            "fleet_tags",
+            "fleet_vehicles_fuel_energy",
+            "fleet_assets_reefers",
+            # "fleet_assets",
+            # "fleet_trailers"
+        ]
+    """
+    configs_for_update = {
+        "fleet_devices": {
+            "download_type": "one_shot",
+        },
+        "fleet_vehicles_fuel_energy": {
+            "download_type": "time",
+            "last_update_date": start_date
+        },
+    }
+    """
 
     gcs_client = GCSClient(bucket_name=gcs_bucket_name)
-    if end_date is None:
-        end_date = datetime.now().strftime("%d/%m/%Y")
-    if start_date is None:
-        try:
-            config = gcs_client.get_config()
-            start_date = config.get("last_update_date")
-        except Exception as e:
-            msg = f"Erreur lors de la récupération de la date de début: {e}, La date de debut par défaut 01/01/2021 sera utilisée"
-            print(msg)
-            standard_logger.warning(msg)
-            start_date = "01/01/2021"
+    configs_for_update = gcs_client.get_configs_for_update()
+
+    metadata = build_metadata(configs_for_update=configs_for_update, table_names=table_names, start_date=start_date, end_date=end_date)
+    if metadata.empty:
+        standard_logger.error("Aucune metadata trouvée pour les tables spécifiées.")
+        exit()
 
     max_workers = args.max_workers
 
-    dates = [
-        {"start_date": start_date, "end_date": end_date},
-    ]
-    for index, date in enumerate(dates):
-        start = datetime.now()
-        scrape_samsara_to_gcs(
-            start_date=start_date,
-            end_date=end_date,
-            iteration=index,
-            table_names=table_names,
-            max_workers=max_workers
-        )
-        end = datetime.now()
-        td = (end - start).total_seconds()
-        standard_logger.info(f"Temps d'exécution {index} : {td} secondes pour la période {date['start_date']} - {date['end_date']}")
-        print(f"Temps d'exécution {index}: {td} secondes pour la période {date['start_date']} - {date['end_date']}")
+    start = datetime.now()
+    scrape_samsara_to_gcs(
+        metadata=metadata,
+        iteration=0,
+        max_workers=max_workers
+    )
+    end = datetime.now()
+    td = (end - start).total_seconds()
+    standard_logger.info(f"Temps d'exécution sans les endpoint avec des exceptions: {td} secondes ")
+    print(f"Temps d'exécution : {td} secondes ")
 
     filters = ["is_exception"]
-    for index, filter in enumerate(filters):
+    for index, filter_ in enumerate(filters):
         start = datetime.now()
-        scrape_samsara_to_gcs(start_date, end_date, index, is_exception=True, filter=filter, table_names=table_names, max_workers=max_workers)
+        scrape_samsara_to_gcs(metadata=metadata, iteration=index, is_exception=True, max_workers=max_workers)
         end = datetime.now()
         td = (end - start).total_seconds()
-        standard_logger.info(f"Temps d'exécution exception '{filter}': {td} secondes pour la période '{start_date}' - '{end_date}'")
-        print(f"Temps d'exécution exception '{filter}': {td} secondes pour la période '{start_date}' - '{end_date}'")
+        standard_logger.info(f"Temps d'exécution pour l'exception '{filter_}': {td} secondes ")
 
-    upload_missing_files(table_names, start_date, end_date, max_workers)
-
-    load_to_bigquery(table_names=table_names, last_update_str_date=start_date)
-
-    upload_logs()
-
-    gcs_client.update_config({"last_update_date": end_date})
+    # download_missing_files(table_names, start_date, end_date, max_workers)
+    #
+    # load_to_bigquery(configs_for_update=configs_for_update, table_names=table_names)
+    #
+    # upload_logs()
+    #
+    # gcs_client.update_configs_for_update(metadata=metadata, end_time=end_date)
