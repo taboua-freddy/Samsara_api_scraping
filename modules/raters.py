@@ -72,30 +72,30 @@ class EndpointRateLimiter:
 
 class MemoryAccess:
     def __init__(self):
-        self.memory = {}
-        self.lock = Lock()
+        self.__memory = {}
+        self.__lock = Lock()
 
     def read(self, key):
-        with self.lock:
-            return self.memory.get(key)
+        with self.__lock:
+            return self.__memory.get(key)
 
     def write(self, key, value):
-        with self.lock:
-            self.memory[key] = value
+        with self.__lock:
+            self.__memory[key] = value
 
     def alter_value(self, func: callable, key, *args, **kwargs):
-        with self.lock:
-            self.memory[key] = func(self.memory[key], *args, **kwargs)
+        with self.__lock:
+            self.__memory[key] = func(self.__memory[key], *args, **kwargs)
             if key == "metadata":
-                self.memory[key].to_excel("metadata.xlsx", index=False, header=True)
+                self.__memory[key].to_excel("metadata.xlsx", index=False, header=True)
 
     def delete(self, key):
-        with self.lock:
-            if key in self.memory:
-                del self.memory[key]
+        with self.__lock:
+            if key in self.__memory:
+                del self.__memory[key]
             else:
                 raise KeyError(f"La clé '{key}' n'existe pas dans la mémoire")
 
     def clear(self):
-        with self.lock:
-            self.memory.clear()
+        with self.__lock:
+            self.__memory.clear()

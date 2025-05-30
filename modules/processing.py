@@ -1,3 +1,4 @@
+import gc
 import json
 import os.path
 from typing import Literal
@@ -7,9 +8,10 @@ import pytz
 from .gcp import GCSClient
 from .logs import MyLogger
 from .samsara import SamsaraClient
+from .transformation_configs import transformation_configs
 from .utils import flatten_data, parquet_buffer, seconds_to_minutes, DATA_DIR, parallelize_execution, \
     get_start_end_date_config, date_to_iso_or_timestamp, process_params, timestamp_ms_to_timestamp, \
-    DEFAULT_RATE_LIMIT_SECOND, split_list
+    DEFAULT_RATE_LIMIT_SECOND, split_list, extract_suffixe, TMP_DIR
 import pandas as pd
 from datetime import datetime, timedelta
 
@@ -327,34 +329,52 @@ class DataFetcher:
             if df.empty:
                 self.logger.info(f"Aucune donnée pour le {date_str} de la table {self.endpoint_info.get('table_name')}, endpoint: {self.endpoint_info.get('endpoint')}")
                 return
+
             self.endpoint_info.update({"date_str": date_str})
             df = self.transformer.set_data(df, self.endpoint_info).transform()
+            # df.to_json(f'{DATA_DIR}/{file_name}.json', orient='records', lines=False)
             table_name = self.endpoint_info.get('table_name')
-            allow_unique_name = self.endpoint_info.get('download_type', '') != "oneshot"
-            # Transformation de la table des codes défauts
-            if table_name == "fleet_vehicle_stats_faultCodes":
-                result: dict[str, pd.DataFrame] = self.transformer.set_data(df, {"table_name": "fleet_vehicle_stats_faultCodes_split"}).transform()
-                for table, table_df in result.items():
-                    if not table_df.empty:
-                        file_name = f'{table}_{date_str}'
-                        # table_df.to_json(f'{DATA_DIR}/{file_name}.json', orient='records', lines=False)
-                        destination_blob_name = f'{self.endpoint_info.get("folder_path")}/{file_name}.parquet'
-                        buffer = parquet_buffer(table_df)
-                        self.gcs_client.upload_bytes(buffer, destination_blob_name, allow_unique_name=allow_unique_name)
-            else:
-                # df.to_json(f'{DATA_DIR}/{file_name}.json', orient='records', lines=False)
-                destination_blob_name = f'{self.endpoint_info.get("folder_path")}/{file_name}.parquet'
-                buffer = parquet_buffer(df)
-                self.gcs_client.upload_bytes(buffer, destination_blob_name)
+            # allow_unique_name = self.endpoint_info.get('download_type', '') != "oneshot"
+            # # Transformation de la table des codes défauts
+
+            dfs = self.split_data(df, table_name)
+            if (suffixe := extract_suffixe(file_name)) is None:
+                suffixe = date_str
+            for table, table_df in dfs.items():
+                if not table_df.empty:
+                    file_name = f'{table}_{suffixe}'
+                    # table_df.to_json(f'{TMP_DIR}/{file_name}.json', orient='records', lines=False)
+                    destination_blob_name = f'{self.endpoint_info.get("folder_path")}/{file_name}.parquet'
+                    buffer = parquet_buffer(table_df)
+                    self.gcs_client.upload_bytes(buffer, destination_blob_name)
         else:
             self.logger.info(f"Aucune donnée pour le {date_str} de la table {self.endpoint_info.get('table_name')}")
 
+    def split_data(self, df: pd.DataFrame, table_name: str, **kwargs) -> dict[str, pd.DataFrame]:
+        if table_name in self.transformer.tables_to_split:
+            results: dict[str, pd.DataFrame] = self.transformer.set_data(df, {"table_name": f"{table_name}_split"}).transform()
+            for table_name in results:
+                if not results[table_name].empty:
+                    results[table_name] = self.transformer.set_data(results[table_name], {"table_name": table_name}).transform()
+        else:
+            results = {table_name: df}
+        return results
 
 class TransformData:
+
+    _tables_to_split = ["fleet_vehicle_stats_faultCodes", "fleet_assets_reefers", "fleet_tags", "fleet_devices"]
+
+    @property
+    def tables_to_split(self) -> list[str]:
+        """
+        Retourne la liste des tables à diviser
+        :return: list[str]
+        """
+        return self._tables_to_split
     def __init__(self):
         self.df = None
         self.endpoint_info = None
-        self.logger = MyLogger("TransformData")
+        self.logger = MyLogger("TransformData", True)
 
     def set_data(self, data: pd.DataFrame, endpoint_info: dict) -> "TransformData":
         """
@@ -372,127 +392,13 @@ class TransformData:
         :return: dict
         """
         table_name = self.endpoint_info.get('table_name')
-        value = None
-        if table_name == "fleet_vehicles_fuel_energy":
-            value: str | None = self.endpoint_info.pop('date_str', None)
-            if value:
-                value = value.replace("_", "-")
+        value: str | None = self.endpoint_info.pop('date_str', None)
+        if table_name == "fleet_vehicles_fuel_energy" and value:
+            value = value.replace("_", "-")
 
-        configs = {
-            # EV
-            "fleet_vehicle_stats_evAverageBatteryTemperatureMilliCelsius": get_standard_transformation_config("evAverageBatteryTemperatureMilliCelsius"),
-            "fleet_vehicle_stats_evBatteryStateOfHealthMilliPercent": get_standard_transformation_config("evBatteryStateOfHealthMilliPercent"),
-            "fleet_vehicle_stats_evChargingCurrentMilliAmp": get_standard_transformation_config("evChargingCurrentMilliAmp"),
-            "fleet_vehicle_stats_evChargingEnergyMicroWh": get_standard_transformation_config("evChargingEnergyMicroWh"),
-            "fleet_vehicle_stats_evChargingStatus": get_standard_transformation_config("evChargingStatus"),
-            "fleet_vehicle_stats_evChargingVoltageMilliVolt": get_standard_transformation_config("evChargingVoltageMilliVolt"),
-            "fleet_vehicle_stats_evConsumedEnergyMicroWh": get_standard_transformation_config("evConsumedEnergyMicroWh"),
-            "fleet_vehicle_stats_evDistanceDrivenMeters": get_standard_transformation_config("evDistanceDrivenMeters"),
-            "fleet_vehicle_stats_evRegeneratedEnergyMicroWh": get_standard_transformation_config("evRegeneratedEnergyMicroWh"),
-            "fleet_vehicle_stats_evStateOfChargeMilliPercent": get_standard_transformation_config("evStateOfChargeMilliPercent"),
-
-            # Thermique
-            "fleet_vehicle_stats_obdEngineSeconds": get_standard_transformation_config("obdEngineSeconds"),
-            "fleet_vehicle_stats_engineStates": get_standard_transformation_config("engineStates"),
-            "fleet_vehicle_stats_gpsOdometerMeters": get_standard_transformation_config("gpsOdometerMeters"),
-            "fleet_vehicle_stats_ecuSpeedMph": get_standard_transformation_config("ecuSpeedMph"),
-            "fleet_vehicles_fuel_energy": index_transformations(
-                get_trans_to_set_df_column("date", value=value),
-                get_trans_to_cast_column_type(
-                    ["efficiencyMpge", "energyUsedKwh", "estFuelEnergyCost_amount", "estCarbonEmissionsKg"],
-                    dtype=float),
-                get_trans_to_rename_columns({"vehicle_name": "PARC_ID"}),
-            ),
-            "fleet_vehicle_stats_faultCodes": index_transformations(
-                get_trans_to_explode_df("faultCodes"),
-                get_trans_to_json_normalize_df("faultCodes"),
-                get_trans_to_rename_columns({
-                    "j1939_checkEngineLights_protectIsOn": "j1939_protect_engine_light_On",
-                    "j1939_checkEngineLights_warningIsOn": "j1939_warning_engine_light_On",
-                    "j1939_checkEngineLights_stopIsOn": "j1939_stop_engine_light_On",
-                    "j1939_checkEngineLights_emissionsIsOn": "j1939_emissions_engine_light_On",
-                    "obdii_checkEngineLightIsOn": "obdii_engine_light_on"
-                }),
-                get_trans_to_explode_df("j1939_diagnosticTroubleCodes"),
-                get_trans_to_json_normalize_df("j1939_diagnosticTroubleCodes", prefix="j1939_diag_trouble_codes_"),
-                get_trans_to_explode_df("obdii_diagnosticTroubleCodes"),
-                get_trans_to_json_normalize_df("obdii_diagnosticTroubleCodes", prefix="obdii_"),
-                get_trans_to_explode_df("obdii_pendingDtcs"),
-                get_trans_to_explode_df("obdii_permanentDtcs"),
-                get_trans_to_explode_df("obdii_confirmedDtcs"),
-                get_trans_to_json_normalize_df("obdii_confirmedDtcs", prefix="obdii_confirmed_"),
-                get_trans_to_json_normalize_df("obdii_pendingDtcs", prefix="obdii_pending_"),
-                get_trans_to_json_normalize_df("obdii_permanentDtcs", prefix="obdii_permanent_"),
-            ),
-            "fleet_vehicle_stats_faultCodes_split": index_transformations(
-                get_trans_to_split_df(shared_cols=["vehicle_id", "PARC_ID", "time", "canBusType"], split_configs={
-                    "fleet_vehicle_stats_faultCodes_obdii": {
-                        "prefix": "obdii_",
-                        "drop_duplicates": True,
-                        "query": "obdii_engine_light_on.notna() or obdii_txId.notna() or obdii_confirmed_dtcId.notna() or obdii_pending_dtcId.notna() or obdii_permanent_dtcId.notna()"
-                    },
-                    "fleet_vehicle_stats_faultCodes_j1939": {
-                        "prefix": "j1939_",
-                        "drop_duplicates": True,
-                        "query": "j1939_emissions_engine_light_On.notna() or j1939_protect_engine_light_On.notna() or j1939_stop_engine_light_On.notna() or j1939_warning_engine_light_On.notna() or j1939_diag_trouble_codes_spnId.notna() or j1939_diag_trouble_codes_fmiId.notna()"
-                    }},
-                    drop_duplicates=True,
-                )
-            ),
-            # "": get_standard_transformation_config(),
-            "fleet_safety_events": index_transformations(
-                get_trans_to_explode_df("behaviorLabels"),
-                get_trans_to_json_normalize_df("behaviorLabels", prefix="behavior_"),
-                get_trans_to_rename_columns({"id": "event_id"})
-            ),
-            # Groupe froid
-            "fleet_assets_reefers": index_transformations(
-                get_trans_to_explode_df("ReeferStats_engineHours"),
-                get_trans_to_json_normalize_df("ReeferStats_engineHours"),
-                get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
-                get_trans_to_rename_columns({"changedAtMs": "engineHoursChangedAt"}),
-                get_trans_to_explode_df("ReeferStats_fuelPercentage"),
-                get_trans_to_json_normalize_df("ReeferStats_fuelPercentage"),
-                get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
-                get_trans_to_rename_columns({"changedAtMs": "fuelPercentageChangedAt"}),
-                get_trans_to_explode_df("ReeferStats_returnAirTemperature"),
-                get_trans_to_json_normalize_df("ReeferStats_returnAirTemperature"),
-                get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
-                get_trans_to_rename_columns({"changedAtMs": "returnAirTemperatureChangedAt"}),
-            ),
-            # Non temporel
-            "fleet_vehicles": index_transformations(
-                get_trans_to_drop_columns(["tags", "sensorConfiguration_areas"]),
-                get_trans_to_rename_columns({"id": "vehicle_id", "name": "PARC_ID"}),
-                include_default_trans=False
-            ),
-            "fleet_assets": index_transformations(
-                get_trans_to_explode_df("assets"),
-                get_trans_to_json_normalize_df("assets"),
-            ),
-            "fleet_trailers": index_transformations(
-                get_trans_to_drop_columns(["tags"]),
-                get_trans_to_rename_columns({"id": "vehicle_id", "name": "PARC_ID"}),
-                include_default_trans=False
-            ),
-            "fleet_tags": index_transformations(
-                get_trans_to_rename_columns({"id": "tag_id", "name": "tag_name"}),
-                get_trans_to_explode_df("vehicles"),
-                get_trans_to_explode_df("assets"),
-                # get_trans_to_explode_df("sensors"),
-                # get_trans_to_explode_df("addresses"),
-                get_trans_to_json_normalize_df("vehicles", prefix="vehicle_"),
-                # get_trans_to_json_normalize_df("assets", prefix="assets_"),
-                # get_trans_to_json_normalize_df("sensors", prefix="sensors_"),
-                # get_trans_to_json_normalize_df("addresses", prefix="addresses_"),
-                get_trans_to_drop_columns(["machines", "addresses", "drivers"])
-            ),
-            "fleet_devices": index_transformations(
-                get_trans_to_explode_df("health_healthReasons"),
-                get_trans_to_json_normalize_df("health_healthReasons")
-            ),
-        }
-
+        configs = transformation_configs(
+            **{"fuel_energy_date": value}
+        )
         return configs.get(table_name, {})
 
     def transform(self) -> pd.DataFrame| dict[str, pd.DataFrame]:
@@ -501,9 +407,14 @@ class TransformData:
         :return:
         """
         config = self._get_transform_config()
+        function_name = 'Unknown'
+        step_config = {}
         try:
+            # self.logger.info(f"Taille initiale du DataFrame: {self.df.shape if isinstance(self.df, pd.DataFrame) else {k: v.shape for k, v in self.df.items()}}")
+            n_configs = len(config)
             for step, step_config in config.items():
                 function_name = step_config.get("function")
+                self.logger.info(f"Transformation étape: {step}/{n_configs} - Table: {self.endpoint_info.get('table_name')} - Fonction: {function_name}")
                 if step_config.get("type_function") == "is_df_function":
                     function = getattr(self.df, function_name)
                     self.df = function(**step_config.get("kwargs", {}))
@@ -513,7 +424,12 @@ class TransformData:
                 elif step_config.get("type_function") == "is_custom_function":
                     function = globals().get(function_name)
                     self.df = function(self.df, **step_config.get("kwargs", {}))
+
+                # self.logger.info(f"Taille après transformation :{step}/{n_configs} - {self.df.shape if isinstance(self.df, pd.DataFrame) else {k: v.shape for k, v in self.df.items()}}")
+
+            # self.logger.info(f"Taille finale du DataFrame: {self.df.shape if isinstance(self.df, pd.DataFrame) else {k: v.shape for k, v in self.df.items()}}")
+
         except Exception as e:
-            self.logger.error(f"Erreur lors de la transformation des données: {e} pour la table {self.endpoint_info.get("table_name")} avec la fonction {function_name} et la configuration {step_config}")
+            self.logger.error(f"Erreur lors de la transformation des données: {e} pour la table {self.endpoint_info.get('table_name')} avec la fonction {function_name} et la configuration {step_config}")
         return self.df
 

@@ -2,14 +2,58 @@ import io
 import logging
 import os
 import re
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, Literal, Any
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 import pandas as pd
 import numpy as np
 import pytz
+from google.cloud import bigquery
 
+
+def pandas_to_bq_schema(df: pd.DataFrame, time_col: str | None = None) -> list[bigquery.SchemaField]:
+    bq_types = {
+        'object': 'STRING',
+        'int64': 'INTEGER',
+        'float64': 'FLOAT',
+        'bool': 'BOOLEAN',
+        'datetime64[ns]': 'TIMESTAMP',
+        'datetime64[ns, UTC]': 'TIMESTAMP',
+        'datetime64[us, UTC]': 'TIMESTAMP',
+
+    }
+    schema = []
+    for col, dtype in df.dtypes.items():
+        dtype_str = str(dtype)
+        if col == time_col:
+            # Si la colonne est le time_col, on la convertit en TIMESTAMP
+            schema.append(bigquery.SchemaField(col, 'TIMESTAMP'))
+        else:
+            if dtype_str not in bq_types:
+                raise ValueError(f"Type {dtype_str} non supporté pour la colonne {col}")
+            schema.append(bigquery.SchemaField(col, bq_types[dtype_str]))
+    return schema
+
+def reverse_mapping(mapping: dict[str, str]) -> dict[str, list[str]]:
+    reversed_mapping = defaultdict(list)
+    for key, value in mapping.items():
+        reversed_mapping[value].append(key)
+    return dict(reversed_mapping)
+def extract_suffixe(filename: str) -> str | None:
+    """    Extrait le suffixe d'un nom de fichier au format
+    - 'fleet_drivers_2024_12_22.parquet' -> '2024_12_22'
+    - 'fleet_drivers_2024_12_22_to_2024_12_25.parquet' -> '2024_12_22_to_2024_12_25'
+    - 'fleet_drivers_2024_12_22_to_2024_12_25_02.parquet' -> '2024_12_22_to_2024_12_25_02'
+    :param filename: nom du fichier
+    :return: suffixe du nom de fichier ou None si le format n'est pas respecté
+    """
+    match = re.match(r'^[a-zA-Z0-9_]+?_(\d{4}_\d{2}_\d{2}.*)', filename)
+    return match.group(1) if match else None
 
 def has_function(obj, function_name: str) -> bool:
     """
@@ -99,11 +143,24 @@ def parquet_buffer(dataframe: pd.DataFrame) -> io.BytesIO:
     """
     Transforme le DataFrame en format Parquet et le place dans un buffer pour le stockage.
     """
-    parquet_buffer = io.BytesIO()
-    dataframe.to_parquet(parquet_buffer, index=False, engine='pyarrow')
-    # Revenir au début du buffer avant de l'uploader
-    parquet_buffer.seek(0)
-    return parquet_buffer
+    buffer = io.BytesIO()
+
+    fields = []
+    for col in dataframe.columns:
+        if pd.api.types.is_datetime64_any_dtype(dataframe[col]):
+            fields.append(pa.field(col, pa.timestamp('us')))  # encodé comme TIMESTAMP(MICROS)
+        else:
+            fields.append(pa.field(col, pa.array(dataframe[col]).type))
+
+    schema = pa.schema(fields)
+
+    # Convertir le DataFrame en Table Arrow avec le schéma explicite
+    table = pa.Table.from_pandas(dataframe, preserve_index=False)
+    table = table.cast(schema)
+    pq.write_table(table, buffer)
+    buffer.seek(0)
+
+    return buffer
 
 
 def file_buffer(file)-> io.BytesIO:

@@ -1,8 +1,66 @@
-from typing import Any
+import gc
+from typing import Any, Optional, Generator
 
+import numpy as np
 import pandas as pd
+from multiprocessing import Pool, cpu_count
 
-def json_normalize(df: pd.DataFrame, record_path: str, sep: str='_',prefix: str = '', meta_cols: list[str] = None, record_prefix=None)->pd.DataFrame:
+from modules.interface import SplitDFConfig
+
+
+def _normalize_row(args):
+    record, base, sep, prefix, record_prefix = args
+    normalized_rows = []
+
+    if isinstance(record, list):
+        if record:
+            norm = pd.json_normalize(record, sep=sep, record_prefix=record_prefix)
+            rows = norm.to_dict(orient="records")
+            for row in rows:
+                normalized_rows.append({**base, **{f"{prefix}{k}": v for k, v in row.items()}})
+        else:
+            normalized_rows.append(base)
+    elif isinstance(record, dict):
+        norm = pd.json_normalize(record, sep=sep, record_prefix=record_prefix)
+        row = norm.to_dict(orient="records")[0] if not norm.empty else {}
+        normalized_rows.append({**base, **{f"{prefix}{k}": v for k, v in row.items()}})
+
+    return normalized_rows or [base]
+
+def fast_json_normalize_parallel(
+    df: pd.DataFrame,
+    record_path: str,
+    sep: str = '_',
+    prefix: str = '',
+    meta_cols: list[str] = None,
+    record_prefix: str = None,
+    n_processes: int = None
+) -> pd.DataFrame:
+    if meta_cols is None:
+        meta_cols = [col for col in df.columns if col != record_path]
+    if n_processes is None:
+        n_processes = max(1, cpu_count() - 1)
+
+    valid_mask = df[record_path].apply(lambda x: isinstance(x, (list, dict)))
+    df_valid = df[valid_mask].copy()
+    meta_data = df_valid[meta_cols].to_dict(orient='records')
+
+    args = [
+        (record, base, sep, prefix, record_prefix)
+        for record, base in zip(df_valid[record_path], meta_data)
+    ]
+
+    with Pool(processes=n_processes) as pool:
+        results = pool.map(_normalize_row, args)
+
+    normalized_parts = [item for sublist in results for item in sublist]
+
+    df_invalid = df[~valid_mask]
+    normalized_parts.extend(df_invalid[meta_cols].to_dict(orient='records'))
+
+    return pd.DataFrame(normalized_parts)
+
+def json_normalize(df: pd.DataFrame, record_path: str, sep: str='_',prefix: str = '', meta_cols: Optional[list[str]] = None, record_prefix=None)->pd.DataFrame:
     """
     Aplatie une colonne contenant des objets JSON (dicts ou listes de dicts).
 
@@ -16,32 +74,36 @@ def json_normalize(df: pd.DataFrame, record_path: str, sep: str='_',prefix: str 
     Returns:
         pd.DataFrame: un DataFrame aplati.
     """
+
     if meta_cols is None:
         meta_cols = [col for col in df.columns if col != record_path]
 
-    # Liste pour stocker les morceaux aplatis
-    all_rows = []
+        # On filtre les lignes valides (dict) pour éviter erreurs
+        is_dict = df[record_path].apply(lambda x: isinstance(x, dict))
+        df_valid = df[is_dict].copy()
 
-    for idx, row in df.iterrows():
-        base_data = row[meta_cols].to_dict()
-        raw_json = row[record_path]
+        # On normalise la colonne json_col
+        normalized = pd.json_normalize(
+            df_valid[record_path],
+            sep=sep
+        )
 
-        if isinstance(raw_json, list):  # plusieurs éléments à aplatir
-            for item in raw_json:
-                normalized = pd.json_normalize(item, sep=sep, record_prefix=record_prefix)
-                normalized.rename(columns={col: prefix + col for col in normalized.columns}, inplace=True)
-                combined = {**base_data, **normalized.iloc[0].to_dict()}
-                all_rows.append(combined)
-        elif isinstance(raw_json, dict):  # un seul objet JSON
-            normalized = pd.json_normalize(raw_json, sep=sep, record_prefix=record_prefix)
-            normalized.rename(columns={col: prefix + col for col in normalized.columns}, inplace=True)
-            combined = {**base_data, **normalized.iloc[0].to_dict()}
-            all_rows.append(combined)
-        else:
-            # cas vide ou malformé : on garde juste le contexte
-            all_rows.append(base_data)
+        # On applique un préfixe si demandé
+        if prefix:
+            normalized.columns = [f"{prefix}{col}" for col in normalized.columns]
 
-    return pd.DataFrame(all_rows)
+        # On récupère les colonnes meta
+        meta = df_valid[meta_cols].reset_index(drop=True)
+
+        # On concatène le tout
+        result = pd.concat([meta, normalized], axis=1)
+
+        # On gère les cas où json_col est vide ou invalide
+        if not is_dict.all():
+            fallback = df[~is_dict][meta_cols].copy()
+            result = pd.concat([result, fallback], ignore_index=True)
+
+        return result
 
 def set_column(df: pd.DataFrame, col_name: str, value: str)->pd.DataFrame:
     """
@@ -59,7 +121,7 @@ def to_datetime(df: pd.DataFrame, columns: list[str], format=None, unit=None)->p
         df[column] = pd.to_datetime(df[column], format=format, unit=unit, errors='coerce')
     return df
 
-def cast_column(df: pd.DataFrame, columns: list[str], dtype: Any)->pd.DataFrame:
+def cast_column(df: pd.DataFrame, columns: list[str], dtype: Any, format:str | None = None, utc: bool = False)->pd.DataFrame:
     """
     Convertit le type de données d'une ou plusieurs colonnes d'un DataFrame.
     :param df: DataFrame d'entrée
@@ -70,12 +132,18 @@ def cast_column(df: pd.DataFrame, columns: list[str], dtype: Any)->pd.DataFrame:
     try:
         for column in columns:
             if column in df.columns:
-                df[column] = df[column].astype(dtype)
+                if dtype == "datetime":
+                    if not pd.api.types.is_datetime64_any_dtype(df[column]):
+                        df[column] = pd.to_datetime(df[column], errors='coerce', utc=utc)
+                    if format:
+                        df[column] = df[column].dt.strftime(format)
+                else:
+                    df[column] = df[column].astype(dtype)
     except ValueError as e:
+        print(f"Erreur lors de la conversion des colonnes {columns} en type {dtype}: {e}")
         return df
     return df
 
-type SplitDFConfig = dict[str, dict[str, Any]]
 
 def split_dataframe(df: pd.DataFrame, shared_cols: list[str], split_configs: SplitDFConfig) -> dict[str, pd.DataFrame]:
     """
@@ -86,12 +154,18 @@ def split_dataframe(df: pd.DataFrame, shared_cols: list[str], split_configs: Spl
     :return: dict[str, pd.DataFrame]
     """
     result = {}
+    for shared_col in shared_cols:
+        if shared_col not in df.columns:
+            shared_cols.remove(shared_col)
     for table_name, configs in split_configs.items():
         if prefix := configs.get("prefix"):
             columns = [col for col in df.columns if col.startswith(prefix)]
         else:
             columns = configs.get("columns", [])
-        result[table_name] = df[shared_cols + columns].copy()
+            for col in columns:
+                if col not in df.columns:
+                    columns.remove(col)
+        result[table_name] = df.loc[:, shared_cols + columns].copy()
         if configs.get("drop_duplicates", False):
             result[table_name] = result[table_name].drop_duplicates(subset=configs.get("subset", None))
         if query := configs.get("query"):
@@ -107,117 +181,80 @@ def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
     """
     return df.query(query)
 
-def get_trans_to_filter_df(query: str) -> dict:
+
+def _explode_in_n_chunks(
+        df: pd.DataFrame,
+        column: str,
+        n: int
+) -> Generator[pd.DataFrame, None, None]:
     """
-    Crée une transformation pour filtrer un DataFrame en fonction d'une requête.
-    :param query: requête de filtrage
-    :return: dictionnaire de transformation
+    Divise un DataFrame en `n` parties, puis applique un `explode` sur une colonne contenant des listes.
+
+    Args:
+        df (pd.DataFrame): DataFrame à traiter
+        column (str): colonne à exploser
+        n (int): nombre de chunks souhaités
+
+    Yields:
+        pd.DataFrame: une portion explosée du DataFrame
     """
-    return {
-        "type_function": "is_custom_function",
-        "function": "filter_df",
-        "kwargs": {"query": query},
-    }
+    splits = np.array_split(df, n)
 
-def get_standard_transformation_config(column_name: str, current_index=0) -> dict[int, dict]:
+    for chunk in splits:
+        chunk = chunk.copy()
+
+        # Convertir les valeurs non-listes en liste pour éviter explode sur types simples
+        chunk[column] = chunk[column].apply(
+            lambda x: x if isinstance(x, list) else [x] if pd.notnull(x) else []
+        )
+
+        exploded = chunk.explode(column, ignore_index=True)
+        yield exploded
+        gc.collect()
+
+
+def explode_dataframe(
+        df: pd.DataFrame,
+        column: str,
+        n_chunks: int = 1
+) -> pd.DataFrame:
     """
-    Fonction de configuration standard pour les transformations de données
-    :param column_name: nom de la colonne à transformer
-    :param record_path: chemin d'enregistrement pour json_normalize
-    :param sep: séparateur pour json_normalize
-    :param drop_column: si True, la colonne d'origine sera supprimée
-    :return: dictionnaire de configuration
+    Explose une colonne d'un DataFrame en plusieurs lignes, en divisant le DataFrame en `n_chunks` parties.
+
+    Args:
+        df (pd.DataFrame): DataFrame à traiter
+        column (str): colonne à exploser
+        n_chunks (int): nombre de chunks pour la division
+
+    Returns:
+        pd.DataFrame: DataFrame avec la colonne explosée
     """
-    return index_transformations(
-        get_trans_to_explode_df(column_name),
-        get_trans_to_json_normalize_df(column_name),
-        get_trans_to_drop_columns([column_name]),
-        get_trans_to_rename_columns({"value": column_name}),
-        current_index=current_index
-    )
+    if n_chunks <= 1:
+        return df.explode(column, ignore_index=True)
 
-def get_trans_to_split_df(shared_cols: list[str], split_configs: SplitDFConfig, drop_duplicates: bool = False, subset = None):
-    return {
-        "type_function": "is_custom_function",
-        "function": "split_dataframe",
-        "kwargs": {
-            "shared_cols": shared_cols,
-            "split_configs": split_configs,
-            "drop_duplicates": drop_duplicates,
-            "subset": subset
-        }
-    }
+    exploded_dfs = list(_explode_in_n_chunks(df, column, n_chunks))
+    return pd.concat(exploded_dfs, ignore_index=True)
 
-def get_trans_to_drop_duplicates_df(subset=None) -> dict:
-    return {
-        "type_function": "is_df_function",
-        "function": "drop_duplicates",
-        "kwargs": {"subset": subset},
-    }
+def drop_duplicates(
+        df: pd.DataFrame,
+        subset: Optional[list[str]] = None
+) -> pd.DataFrame:
+    """
+    Supprime les doublons d'un DataFrame en fonction d'un sous-ensemble de colonnes.
 
-def get_trans_to_default_trans() -> list[dict]:
-    return [
-        get_trans_to_rename_columns({"id": "vehicle_id", "name": "PARC_ID"}), # "id": "samsara_id",
-        get_trans_to_drop_columns([
-            "externalIds_samsara_serial",
-            "externalIds_samsara_vin",
-            "vehicle_externalIds_samsara_serial",
-            "vehicle_externalIds_samsara_vin"
-        ]),
-        get_trans_to_drop_duplicates_df()
-    ]
+    Args:
+        df (pd.DataFrame): DataFrame à traiter
+        subset (list[str], optional): colonnes à considérer pour la suppression des doublons
 
-def get_trans_to_cast_column_type(columns:list[str], dtype) -> dict:
-    return {
-        "type_function": "is_custom_function",
-        "function": "cast_column",
-        "kwargs": {"columns": columns, "dtype": dtype},
-    }
-def get_trans_to_set_df_column(column_name:str, value:Any) -> dict:
-    return {
-        "type_function": "is_custom_function",
-        "function": "set_column",
-        "kwargs": {"col_name": column_name, "value": f"{value}"},
-    }
+    Returns:
+        pd.DataFrame: DataFrame sans doublons
+    """
 
-def get_trans_to_drop_columns(columns: list) -> dict:
-    return {
-        "type_function": "is_df_function",
-        "function": "drop",
-        "kwargs":  {"columns": columns, "errors": "ignore"},
-    }
+    df_stringified = df.astype({
+        col: 'string' for col in df.select_dtypes(include=['object']).columns
+    })
 
-def get_trans_to_rename_columns(new_columns: dict) -> dict:
-    return {
-        "type_function": "is_df_function",
-        "function": "rename",
-        "kwargs": {"columns": new_columns, "errors": "ignore"},
-    }
+    return df.loc[df_stringified.drop_duplicates(subset=subset).index, :]
 
-def get_trans_to_explode_df(column_name: str) -> dict:
-    return {
-        "type_function": "is_df_function",
-        "function": "explode",
-        "kwargs": {"column": column_name},
-    }
 
-def get_trans_timestamp_to_datetime(column_name: str, unit=None) -> dict:
-    return {
-        "type_function": "is_custom_function",
-        "function": "to_datetime",
-        "kwargs": {"columns": [column_name], "unit": unit},
-    }
 
-def get_trans_to_json_normalize_df(column_name: str, record_path: str=None, sep: str = "_", prefix: str | None = "", record_prefix=None ):
-    if record_path is None:
-        record_path = column_name
-    return {
-        "column_name": column_name,
-        "type_function": "is_custom_function",
-        "function": "json_normalize",
-        "kwargs": {"sep": sep, "record_path": record_path, "prefix": prefix, "record_prefix": record_prefix}, #
-    }
-def index_transformations(*transformations, current_index: int = 0, include_default_trans=True) -> dict[int, dict]:
-    if include_default_trans:
-        transformations = list(transformations) + get_trans_to_default_trans()
-    return {index: trans for index, trans in enumerate(transformations, start=current_index + 1)}
