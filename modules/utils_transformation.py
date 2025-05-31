@@ -250,11 +250,7 @@ def drop_duplicates(
         pd.DataFrame: DataFrame sans doublons
     """
 
-    df_stringified = df.astype({
-        col: 'string' for col in df.select_dtypes(include=['object']).columns
-    })
-
-    return df.loc[df_stringified.drop_duplicates(subset=subset).index, :]
+    return df.iloc[df.astype(str).drop_duplicates(subset=subset).index]
 
 
 

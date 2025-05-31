@@ -217,6 +217,7 @@ class BigQueryManager:
         self.dataset_id = dataset_id
         self.logger = MyLogger("BigQueryManager")
         self.memory_manager: MemoryAccess | None = kwargs.get("memory_manager")
+        self.partition_expiration_days: int = kwargs.get("partition_expiration_days", 30)  # Durée de conservation des partitions
 
     def load_parquet_to_bigquery(self, uri: list[str], table_name: str) -> None:
         """Charger un fichier Parquet de GCS vers BigQuery."""
@@ -259,6 +260,7 @@ class BigQueryManager:
                         "time_partitioning": bigquery.TimePartitioning(
                             type_=bigquery.TimePartitioningType.DAY,
                             field=time_partitioning_field,
+                            expiration_ms=int(timedelta(days=self.partition_expiration_days).total_seconds() * 1000),
                         )
                     })
                 if not pd.isnull(clustering_fields := metadata.get("clustering_fields")):
