@@ -5,6 +5,11 @@ from logging.handlers import RotatingFileHandler
 from .utils import LOGS_DIR
 
 
+class OnlyInfoFilter(logging.Filter):
+    def filter(self, record):
+        return record.levelno == logging.INFO
+
+
 class MyLogger:
 
     def __init__(self, name: str, with_console: bool = False, with_file: bool = True):
@@ -28,6 +33,7 @@ class MyLogger:
             )
             info_handler.setLevel(logging.INFO)
             info_handler.setFormatter(formatter)
+            info_handler.addFilter(OnlyInfoFilter())
             self.logger.addHandler(info_handler)
             error_handler = RotatingFileHandler(
                 f'{LOGS_DIR}/{name}_error_{log_date}.log',

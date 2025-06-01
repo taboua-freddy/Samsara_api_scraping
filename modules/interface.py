@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 
 class TypeFilter(Enum):
@@ -11,6 +11,7 @@ class TypeFilter(Enum):
     EXCEPTION = "exception"
     EXCEPTION_DATE_ONLY_START_DATE = "exception_date_only_start_date"
     ALL = "all"
+
 
 class JSONNormalizeType(Enum):
     FAST_JSON_NORMALIZE = "fast_json_normalize_parallel"
@@ -28,3 +29,13 @@ class SearchRetrieveType(Enum):
     DATE_END = "end_date"
     INDEX = "index"
 
+
+class ColumnToUpdate(str, Enum):
+    DOWNLOAD = "last_download_time"
+    TRANSFORMATION = "last_trans_time"
+    DATABASE = "last_db_migration_time"
+
+
+class DownloadType(str, Enum):
+    ONESHOT = "oneshot"
+    TIME = "time"

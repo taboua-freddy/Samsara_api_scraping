@@ -1,104 +1,136 @@
 from datetime import datetime
-from enum import Enum
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import pytz
 
-from .interface import TypeFilter
-from .utils import timestamp_to_timestamp_ms, date_to_timestamp, date_to_iso_or_timestamp, cast_date
+from .interface import TypeFilter, DownloadType, ColumnToUpdate
+from .utils import (
+    timestamp_to_timestamp_ms,
+    date_to_timestamp,
+    date_to_iso_or_timestamp,
+    cast_date, DEFAULT_START_DATE,
+)
 
-def is_exception_date(row:pd.Series) -> bool:
+
+def is_exception_date(row: pd.Series) -> bool:
     if row.get("is_exception") == 1:
-        if row.get("exception_config",{}).get("exception_type") == "date":
+        if row.get("exception_config", {}).get("exception_type") == "date":
             if row.get("exception_config").get("constraint") == "is_data_but_datetime":
                 return True
     return False
 
-def is_exception_date_only_start_date(row:pd.Series) -> bool:
+
+def is_exception_date_only_start_date(row: pd.Series) -> bool:
     if row.get("is_exception") == 1:
-        if row.get("exception_config",{}).get("exception_type") == "date":
+        if row.get("exception_config", {}).get("exception_type") == "date":
             if row.get("exception_config").get("constraint") == "only_start_date":
                 return True
     return False
 
-def is_exception_table(row:pd.Series) -> bool:
+
+def is_exception_table(row: pd.Series) -> bool:
     if row.get("is_exception") == 1:
-        if row.get("exception_config",{}).get("exception_type") == "table":
+        if row.get("exception_config", {}).get("exception_type") == "table":
             return True
     return False
 
-def is_exception(row:pd.Series) -> bool:
+
+def is_exception(row: pd.Series) -> bool:
     if row.get("is_exception") == 1:
         return True
     return False
 
-def is_date_range(row:pd.Series) -> bool:
+
+def is_date_range(row: pd.Series) -> bool:
     if not is_exception(row):
         params = row.get("params")
-        if not pd.isna(params) and any(["endDate" in params, "endTime" in params, "endMs" in params]):
+        if not pd.isna(params) and any(
+            ["endDate" in params, "endTime" in params, "endMs" in params]
+        ):
             return True
     return False
 
-def is_vehicle_stats(row:pd.Series) -> bool:
+
+def is_vehicle_stats(row: pd.Series) -> bool:
     return row.get("family") == "vehicle_stats"
 
-def is_downloadable_oneshot(row:pd.Series) -> bool:
-    return not is_vehicle_stats(row) and not is_exception(row) and not is_date_range(row)
 
-def get_metadata_by_table_names(metadata:pd.DataFrame, table_names: list[str]) -> pd.DataFrame:
+def is_downloadable_oneshot(row: pd.Series) -> bool:
+    return (
+        not is_vehicle_stats(row) and not is_exception(row) and not is_date_range(row)
+    )
+
+
+def get_metadata_by_table_names(
+    metadata: pd.DataFrame, table_names: list[str]
+) -> pd.DataFrame:
     # metadata = make_meta_data("metadata.xlsx", start_time, end_time)
     return metadata[metadata["table_name"].isin(table_names)]
 
-def get_metadata(metadata: pd.DataFrame, table_names: list[str] = None, filter: Optional[TypeFilter] = TypeFilter.ALL) -> pd.DataFrame:
+
+def get_metadata(
+    metadata: pd.DataFrame,
+    table_names: list[str] = None,
+    filter_: Optional[TypeFilter] = TypeFilter.ALL,
+) -> pd.DataFrame:
     if table_names is not None:
         metadata = get_metadata_by_table_names(metadata, table_names)
-    if filter == TypeFilter.EXCEPTION_DATE:
+    if filter_ == TypeFilter.EXCEPTION_DATE:
         return metadata[metadata.apply(is_exception_date, axis=1)]
-    elif filter == TypeFilter.EXCEPTION_TABLE:
+    elif filter_ == TypeFilter.EXCEPTION_TABLE:
         return metadata[metadata.apply(is_exception_table, axis=1)]
-    elif filter == TypeFilter.DATE_RANGE:
+    elif filter_ == TypeFilter.DATE_RANGE:
         return metadata[metadata.apply(is_date_range, axis=1)]
-    elif filter == TypeFilter.VEHICLE_STATS:
+    elif filter_ == TypeFilter.VEHICLE_STATS:
         return metadata[metadata.apply(is_vehicle_stats, axis=1)]
-    elif filter == TypeFilter.DOWNLOADABLE_ONESHOT:
+    elif filter_ == TypeFilter.DOWNLOADABLE_ONESHOT:
         return metadata[metadata.apply(is_downloadable_oneshot, axis=1)]
-    elif filter == TypeFilter.EXCEPTION:
+    elif filter_ == TypeFilter.EXCEPTION:
         return metadata[metadata.apply(is_exception, axis=1)]
-    elif filter == TypeFilter.EXCEPTION_DATE_ONLY_START_DATE:
+    elif filter_ == TypeFilter.EXCEPTION_DATE_ONLY_START_DATE:
         return metadata[metadata.apply(is_exception_date_only_start_date, axis=1)]
 
     return metadata
 
-def build_metadata(configs_for_update:dict, table_names: list[str], start_date:str|None=None, end_date:str|None=None) -> pd.DataFrame:
+
+def build_metadata(
+    configs_for_update: dict,
+    table_names: list[str],
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
     if start_date is None:
-        start_date = "01/01/2021"
+        start_date = DEFAULT_START_DATE
     if end_date is None:
         end_date = datetime.now().strftime("%d/%m/%Y")
     end_points = []
     for table_name in table_names:
         if table_configs := configs_for_update.get(table_name, {}):
-            if table_configs.get("download_type") == "time":
+            if table_configs.get("download_type") == DownloadType.TIME.value:
                 last_update_time = table_configs.get("last_update_time", None)
-                print(f"Table: {table_name}, Last Update Time: {last_update_time}")
                 if last_update_time is not None:
                     start_date = last_update_time
-        end_point = make_meta_data(start_time=start_date, end_time=end_date).query("table_name == @table_name")
+        end_point = make_meta_data(start_time=start_date, end_time=end_date).query(
+            "table_name == @table_name"
+        )
         if end_point.empty:
             continue
 
         if pd.isnull(download_type := end_point.iloc[0].get("download_type")):
             if (download_type := table_configs.get("download_type")) is None:
-                download_type = "time"
+                download_type = DownloadType.TIME.value
 
         end_point = end_point.assign(download_type=download_type)
-        end_point = end_point.assign(last_update_time=start_date)
+        end_point = end_point.assign(**{ColumnToUpdate.DOWNLOAD.value: start_date})
         end_points.append(end_point)
     return pd.concat(end_points, ignore_index=True) if end_points else pd.DataFrame()
 
 
-def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None = None) -> pd.DataFrame:
+def make_meta_data(
+    start_time: str, end_time: str, metadata_filename: str | None = None
+) -> pd.DataFrame:
     """
     Crée un fichier de métadonnées pour les endpoints
     :param metadata_filename:
@@ -119,11 +151,10 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Milli percent state of charge for electric and hybrid vehicles. Not all EV and HEVs may report this field.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
-
         },
         {
             "family": "vehicle_stats",
@@ -135,11 +166,10 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Charging status of the battery (e.g. charging, discharging, idle).",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
-
         },
         {
             "family": "vehicle_stats",
@@ -151,7 +181,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Energy consumed by the battery during charging or discharging. Positive value indicates charging, negative value indicates discharging.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -166,7 +196,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Voltage of the battery during charging. Millivolt value.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -181,7 +211,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Current of the battery during charging. Milliamp value.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -196,7 +226,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Energy consumed by the battery during driving. ",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -211,7 +241,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Energy regenerated by the battery during driving.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -226,7 +256,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Milli percent battery state of health for electric and hybrid vehicles. ",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -241,7 +271,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Average battery temperature for electric and hybrid vehicles.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -256,7 +286,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Distance driven by electric and hybrid vehicles.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -271,7 +301,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Liste des adresses de l'organisation.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         {
             "family": "core",
@@ -283,24 +313,31 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Liste des configurations d'alertes.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         {
             "family": "alerts",
             "table_name": "alerts_incidents",
             "endpoint": "alerts/incidents/stream",
-            "params": "configurationIds={configurationIds}" + ",startTime={startTime},endTime={endTime}".format(
-                startTime=start_time, endTime=end_time),
+            "params": "configurationIds={configurationIds}"
+            + ",startTime={startTime},endTime={endTime}".format(
+                startTime=start_time, endTime=end_time
+            ),
             "is_processed": 0,
             "rate_limit_per_seconde": 10,
             "description": "Liste des incidents d'alertes pour des configurations données par configurationIds.",
             "is_exception": 1,
-            "exception_config": {"exception_type": "table", "constraint": "dynamic_url",
-                                 "table_name": "alerts_configurations", "table_column_name": f"{samsara_vehicle_id}",
-                                 "exception_param_name": "configurationIds", "key_to_apply_on": "params", "is_list": 1},
+            "exception_config": {
+                "exception_type": "table",
+                "constraint": "dynamic_url",
+                "table_name": "alerts_configurations",
+                "table_column_name": f"{samsara_vehicle_id}",
+                "exception_param_name": "configurationIds",
+                "key_to_apply_on": "params",
+                "is_list": 1,
+            },
             "delta_days": 1,
-            "download_type": "time"
-
+            "download_type": "time",
         },
         {
             "family": "assets",
@@ -312,7 +349,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Liste des actifs de l'organisation.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         {
             "family": "assets",
@@ -324,8 +361,8 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Assets frigorifiques et les statistiques spécifiques aux assets frigorifiques.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
-            "download_type": "time"
+            "delta_days": 1,
+            "download_type": "time",
         },
         {
             "family": "core",
@@ -337,7 +374,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Liste des contacts de l'organisation.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         {
             "family": "documents",
@@ -349,8 +386,8 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Liste des types de documents de l'organisation.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
-            "download_type": "time"
+            "delta_days": 1,
+            "download_type": "time",
         },
         {
             "family": "documents",
@@ -362,8 +399,8 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Liste de tous des documents de l'organisation.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
-            "download_type": "time"
+            "delta_days": 1,
+            "download_type": "time",
         },
         {
             "family": "driver_vehicle_assignments",
@@ -375,8 +412,8 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Affectations conducteur-véhicule pour les conducteurs ou véhicules demandés dans la plage horaire demandée. Pour récupérer les affectations conducteur-véhicule en dehors des plages horaires des trajets du véhicule, assignationType doit être spécifié. Remarque : ce point de terminaison remplace les points de terminaison précédents pour récupérer les affectations par conducteur ou par véhicule.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
-            "download_type": "time"
+            "delta_days": 1,
+            "download_type": "time",
         },
         {
             "family": "drivers",
@@ -388,7 +425,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Liste des conducteurs de l'organisation.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         {
             "family": "equipment",
@@ -400,7 +437,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Liste de tous les équipements d'une organisation. Les objets d'équipement représentent des actifs alimentés connectés à un Samsara AG26 via un câble APWR, CAT ou J1939. Ils sont automatiquement créés avec un identifiant d'équipement Samsara unique chaque fois qu'un AG26 est activé dans votre organisation.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         # {
         #     "family": "fuel_energy",
@@ -424,12 +461,14 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "rate_limit_per_seconde": 25,
             "description": "Données de consommation de carburant et d'énergie pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 1,
-            "exception_config": {"exception_type": "date", "constraint": "is_data_but_datetime"},
-            'delta_days': 1,
+            "exception_config": {
+                "exception_type": "date",
+                "constraint": "is_data_but_datetime",
+            },
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "date",
             "clustering_fields": [f"{samsara_vehicle_id}"],
-
         },
         {
             "family": "hours_of_service",
@@ -441,7 +480,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Horaires de service des conducteurs pour une organisation.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         {
             "family": "hours_of_service",
@@ -453,8 +492,8 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Journaux quotidiens de service des conducteurs pour une organisation.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
-            "download_type": "time"
+            "delta_days": 1,
+            "download_type": "time",
         },
         {
             "family": "hours_of_service",
@@ -466,8 +505,8 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données des violations de service des conducteurs pour une organisation.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
-            "download_type": "time"
+            "delta_days": 1,
+            "download_type": "time",
         },
         # {
         #     "family": "idling",
@@ -492,7 +531,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Evénements de sécurité pour une organisation.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -506,9 +545,12 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "rate_limit_per_seconde": 3,
             "description": "Journaux d'audit des événements de sécurité pour une organisation.",
             "is_exception": 1,
-            "exception_config": {"exception_type": "date", "constraint": "only_start_date"},
-            'delta_days': 1,
-            "download_type": "time"
+            "exception_config": {
+                "exception_type": "date",
+                "constraint": "only_start_date",
+            },
+            "delta_days": 1,
+            "download_type": "time",
         },
         # {
         #     "family": "safety",
@@ -532,11 +574,17 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "rate_limit_per_seconde": 3,
             "description": "Récupère le score de sécurité pour un véhicule ou un conducteur dans une plage horaire donnée.",
             "is_exception": 1,
-            "exception_config": {"exception_type": "table", "constraint": "dynamic_url", "table_name": "fleet_vehicles",
-                                 "table_column_name": f"{samsara_vehicle_id}",
-                                 "exception_param_name": "vehicleId", "key_to_apply_on": "endpoint", "is_list": 0},
-            'delta_days': 1,
-            "download_type": "time"
+            "exception_config": {
+                "exception_type": "table",
+                "constraint": "dynamic_url",
+                "table_name": "fleet_vehicles",
+                "table_column_name": f"{samsara_vehicle_id}",
+                "exception_param_name": "vehicleId",
+                "key_to_apply_on": "endpoint",
+                "is_list": 0,
+            },
+            "delta_days": 1,
+            "download_type": "time",
         },
         {
             "family": "trailers",
@@ -548,7 +596,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Récupère la liste des remorques de l'organisation.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         {
             "family": "vehicle_stats",
@@ -560,7 +608,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de température ambiante en millidégré celsius pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -575,7 +623,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de pression barométrique pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -590,7 +638,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de tension de la batterie pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -605,7 +653,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de niveau de The Diesel Exhaust Fluid (DEF) pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -620,7 +668,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de vitesse du moteur pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -635,7 +683,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de température du liquide de refroidissement du moteur pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -649,7 +697,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "rate_limit_per_seconde": 50,
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -664,7 +712,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de charge du moteur pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -679,7 +727,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de pression d'huile du moteur pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -694,7 +742,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de régime moteur pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -709,7 +757,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données d'état du moteur (Off, On, Idle) pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -724,7 +772,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Codes de défaut pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -739,7 +787,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Pourcentages de carburant pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -754,7 +802,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de distance parcourue pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -769,7 +817,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de compteur kilométrique GPS pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -784,7 +832,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Données de température du collecteur d'admission pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -799,7 +847,7 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "description": "Cumule en seconde du temps de fonctionnement du moteur pour tous les véhicules dans la plage horaire spécifiée.",
             "is_exception": 0,
             "exception_config": {},
-            'delta_days': 1,
+            "delta_days": 1,
             "download_type": "time",
             "time_partitioning_field": "time",
             "clustering_fields": [f"{samsara_vehicle_id}"],
@@ -808,37 +856,37 @@ def make_meta_data(start_time: str, end_time: str, metadata_filename: str | None
             "family": "vehicles",
             "table_name": "fleet_vehicles",
             "endpoint": "fleet/vehicles",
-            "params": f'limit=512', #createdAfterTime={datetime.strptime("01/02/2025", "%d/%m/%Y").replace(tzinfo=pytz.UTC).isoformat()}',
+            "params": f'limit=512, createdAfterTime={datetime.strptime("01/05/2025", "%d/%m/%Y").replace(tzinfo=pytz.UTC).isoformat()}',
             "is_processed": 0,
-            "rate_limit_per_seconde": 25, #createdAfterTime={datetime.strptime(start_time, "%d/%m/%Y").replace(tzinfo=pytz.UTC).isoformat()}
+            "rate_limit_per_seconde": 25,  # createdAfterTime={datetime.strptime(start_time, "%d/%m/%Y").replace(tzinfo=pytz.UTC).isoformat()}
             "description": "Liste des véhicules.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         {
             "family": "core",
             "table_name": "fleet_tags",
             "endpoint": "tags",
-            "params": f'limit=512',
+            "params": f"limit=512",
             "is_processed": 0,
             "rate_limit_per_seconde": 25,
             "description": "Liste des tags.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         {
             "family": "core",
             "table_name": "fleet_devices",
             "endpoint": "devices",
-            "params": f'limit=100,includeHealth=true',
+            "params": f"limit=100,includeHealth=true",
             "is_processed": 0,
             "rate_limit_per_seconde": 5,
             "description": "Liste des boitiers.",
             "is_exception": 0,
             "exception_config": {},
-            "download_type": "oneshot"
+            "download_type": "oneshot",
         },
         # {
         #     "family": "safety",

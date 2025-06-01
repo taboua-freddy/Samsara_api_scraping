@@ -8,9 +8,13 @@ class RateLimiter:
         cette classe implémente un rate limiter pour limiter le nombre de requêtes par seconde
         :param max_calls_per_second: Nombre maximal de requêtes par seconde
         """
-        self.max_calls_per_second: int | float = max_calls_per_second  # Limite de requêtes par seconde
+        self.max_calls_per_second: int | float = (
+            max_calls_per_second  # Limite de requêtes par seconde
+        )
         self.lock: Lock = Lock()  # Verrou pour la gestion des accès simultanés
-        self.tokens: int | float = max_calls_per_second  # Jetons représentant les requêtes disponibles
+        self.tokens: int | float = (
+            max_calls_per_second  # Jetons représentant les requêtes disponibles
+        )
         self.last_timestamp: float = time.time()  #  Dernière mise à jour des jetons
 
     def acquire(self):
@@ -43,7 +47,9 @@ class EndpointRateLimiter:
 
     def __init__(self, max_calls_per_second: int | float = 150):
         self.endpoint_limiters: dict = {}
-        self.global_rate_limiter: RateLimiter = RateLimiter(max_calls_per_second)  # Limite globale de 150 req/s
+        self.global_rate_limiter: RateLimiter = RateLimiter(
+            max_calls_per_second
+        )  # Limite globale de 150 req/s
 
     def get_rate_limiter(self, endpoint: str, max_calls_per_second) -> RateLimiter:
         """
