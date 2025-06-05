@@ -6,6 +6,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Literal, Any
+import tempfile
 
 import pandas as pd
 import pyarrow as pa
@@ -305,6 +306,33 @@ def set_metadata_is_processed(metadata: pd.DataFrame, *args, **kwargs) -> pd.Dat
     return metadata
 
 
+class CustomNamedTemporaryFile:
+    """
+    This custom implementation is needed because of the following limitation of tempfile.NamedTemporaryFile:
+
+    > Whether the name can be used to open the file a second time, while the named temporary file is still open,
+    > varies across platforms (it can be so used on Unix; it cannot on Windows NT or later).
+    """
+    def __init__(self, dir: str | None = None, mode='wb', delete=True):
+        self._mode = mode
+        self._delete = delete
+        self._dir = dir if dir else tempfile.gettempdir()
+
+    def __enter__(self):
+        # Generate a random temporary file name
+        file_name = os.path.join(self._dir, os.urandom(24).hex())
+        # Ensure the file is created
+        open(file_name, "x").close()
+        # Open the file in the given mode
+        self._tempFile = open(file_name, self._mode)
+        return self._tempFile
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._tempFile.close()
+        if self._delete:
+            os.remove(self._tempFile.name)
+
+
 __this_file__ = os.path.abspath(__file__)
 ROOT_PATH = make_path(os.path.dirname(os.path.dirname(__this_file__)))
 RESSOURCES_DIR = make_path(os.path.join(ROOT_PATH, "resources"))
@@ -313,4 +341,4 @@ LOGS_DIR = make_path(os.path.join(RESSOURCES_DIR, "logs"))
 DATA_DIR = make_path(os.path.join(RESSOURCES_DIR, "data"))
 CREDENTIALS_DIR = make_path(os.path.join(ROOT_PATH, "credentials"))
 DEFAULT_RATE_LIMIT_SECOND = 5
-DEFAULT_START_DATE = "01/01/2020"
+DEFAULT_START_DATE = "13/07/2020"

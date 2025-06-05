@@ -7,7 +7,7 @@ import pandas as pd
 from modules.gcp import BucketManager
 from modules.interface import SearchRetrieveType
 from modules.processing import TransformData
-from modules.utils import CREDENTIALS_DIR
+from modules.utils import CREDENTIALS_DIR, date_to_timestamp
 from modules.utils_transformation import json_normalize, set_column, to_datetime, split_dataframe, \
     fast_json_normalize_parallel
 
@@ -21,6 +21,8 @@ database_id = os.getenv('DWH_ID')
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials/maintenance-predictive-445011-fb98a59d6aa3.json"
 
 if __name__ == "__main__":
+    print(date_to_timestamp("05/01/2024")*1000 - date_to_timestamp("04/01/2024", )*1000 )
+    exit()
     file_name = "resources/data/fleet_vehicle_stats_faultCodes_2024_02_01.json"
     with open(file_name, 'r') as file:
         data = json.load(file)

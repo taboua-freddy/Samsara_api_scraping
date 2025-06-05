@@ -32,8 +32,9 @@ class SearchRetrieveType(Enum):
 
 class ColumnToUpdate(str, Enum):
     DOWNLOAD = "last_download_time"
-    TRANSFORMATION = "last_trans_time"
+    TRANSFORMATION = "last_transformation_time"
     DATABASE = "last_db_migration_time"
+    DATE_NO_DATA = "date_no_data"
 
 
 class DownloadType(str, Enum):

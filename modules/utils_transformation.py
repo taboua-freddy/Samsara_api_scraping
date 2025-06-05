@@ -1,11 +1,12 @@
 import gc
+import json
 from multiprocessing import Pool, cpu_count
 from typing import Any, Optional, Generator
 
 import numpy as np
 import pandas as pd
 
-from modules.interface import SplitDFConfig
+from .interface import SplitDFConfig
 
 
 def _normalize_row(args):
@@ -122,7 +123,7 @@ def set_column(df: pd.DataFrame, col_name: str, value: str) -> pd.DataFrame:
     :param value: valeur constante à ajouter
     :return: DataFrame avec la nouvelle colonne
     """
-    df[col_name] = value
+    df.loc[:, col_name] = value
     return df
 
 
@@ -148,6 +149,8 @@ def cast_column(
     :param df: DataFrame d'entrée
     :param columns: liste des noms de colonnes à convertir
     :param dtype: type de données cible (par exemple, 'int', 'float', 'str')
+    :param format: format de date à appliquer si dtype est 'datetime'
+    :param utc: si True, convertit les dates en UTC
     :return: DataFrame avec les colonnes converties
     """
     try:
@@ -202,15 +205,35 @@ def split_dataframe(
     return result
 
 
-def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
+def filter_df(df: pd.DataFrame, query: str, fields_to_check: list[str] | None = None) -> pd.DataFrame:
     """
     Filtre un DataFrame en fonction d'une requête.
     :param df: DataFrame à filtrer
     :param query: requête de filtrage
+    :param fields_to_check: liste de champs à vérifier pour la requête
     :return: DataFrame filtré
     """
+    if fields_to_check is None:
+        fields_to_check = []
+    for field in fields_to_check:
+        if field not in df.columns:
+            return df  # Si un champ requis n'existe pas, retourne le DataFrame original
     return df.query(query)
 
+
+def dropna_df(df: pd.DataFrame, columns: list[str] | None = None) -> pd.DataFrame:
+    """
+    Supprime les lignes contenant des valeurs manquantes dans un DataFrame.
+    :param df: DataFrame à traiter
+    :param columns: liste de colonnes à vérifier pour les valeurs manquantes (si None, vérifie toutes les colonnes)
+    :return: DataFrame sans lignes avec des valeurs manquantes
+    """
+    if columns is None:
+        return df.dropna().reset_index(drop=True)
+
+    _columns = [col for col in columns if col in df.columns]
+
+    return df[~df[_columns].isnull().all(axis=1)].reset_index(drop=True)
 
 def _explode_in_n_chunks(
     df: pd.DataFrame, column: str, n: int
@@ -260,7 +283,32 @@ def explode_dataframe(df: pd.DataFrame, column: str, n_chunks: int = 1) -> pd.Da
     return pd.concat(exploded_dfs, ignore_index=True)
 
 
-def drop_duplicates(
+def explode(df: pd.DataFrame, column: str, ignore_index: bool = True) -> pd.DataFrame:
+    """
+    Explose une colonne d'un DataFrame en plusieurs lignes.
+
+    Args:
+        df (pd.DataFrame): DataFrame à traiter
+        column (str): colonne à exploser
+        ignore_index (bool): si True, réinitialise l'index du DataFrame résultant
+
+    Returns:
+        pd.DataFrame: DataFrame avec la colonne explosée
+    """
+    if column not in df.columns:
+        return df
+    return df.explode(column, ignore_index=ignore_index)
+
+
+def safe_serialize(x):
+    if isinstance(x, (list, dict)):
+        return json.dumps(x, sort_keys=True)
+    if isinstance(x,  np.ndarray):
+        return safe_serialize(x.tolist())
+    return x
+
+
+def drop_duplicates_df(
     df: pd.DataFrame, subset: Optional[list[str]] = None
 ) -> pd.DataFrame:
     """
@@ -274,4 +322,10 @@ def drop_duplicates(
         pd.DataFrame: DataFrame sans doublons
     """
 
-    return df.iloc[df.astype(str).drop_duplicates(subset=subset).index]
+    try:
+        return df.drop_duplicates(subset=subset).reset_index(drop=True)
+    except TypeError:
+        print("TypeError encountered, applying safe serialization")
+        print(f"COlon names: {df.columns.tolist()}")
+        df = df.map(safe_serialize)
+        return df.drop_duplicates(subset=subset).reset_index(drop=True)

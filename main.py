@@ -8,6 +8,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import argparse
 
+from maintenance_predictive.Samsara_api_scraping.modules.interface import DownloadType
 from modules.interface import ColumnToUpdate
 from modules.metadata import get_metadata, build_metadata
 from modules.transformation_configs import MAPPING_TABLES
@@ -45,7 +46,7 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 
 def download_missing_files(
     configs_for_update: dict,
-    table_names: list[str],
+    metadata: pd.DataFrame,
     start_date: str,
     end_date: str,
     max_workers: int = None,
@@ -59,21 +60,18 @@ def download_missing_files(
     )
     gcs_client = GCSClient(bucket_name=gcs_raw_bucket_name)
 
-    missing_files = gcs_client.bucket_manager.missing_files(
-        configs_for_update=configs_for_update,
-        table_names=table_names,
-        start_date=datetime.strptime(start_date, "%d/%m/%Y"),
-        end_date=datetime.strptime(end_date, "%d/%m/%Y"),
-    )
+    missing_dates = gcs_client.bucket_manager.missing_dates(metadata=metadata, configs_for_update=configs_for_update,
+                                                            end_date=datetime.strptime(end_date, "%d/%m/%Y"),
+                                                            start_date=datetime.strptime(start_date, "%d/%m/%Y"))
     tasks = []
 
-    for table_name, dates in missing_files.items():
+    for table_name, dates in missing_dates.items():
         for date in dates:
             start_date = date.strftime("%d/%m/%Y")
             end_date = (date + pd.DateOffset(days=1)).strftime("%d/%m/%Y")
             all_metadata = make_meta_data(start_date, end_date)
             metadata = get_metadata(all_metadata, table_names=[MAPPING_TABLES.get(table_name, table_name)])
-            if metadata.empty or metadata.iloc[0].get("download_type") == "oneshot":
+            if metadata.empty or metadata.iloc[0].get("download_type") == DownloadType.ONESHOT.value:
                 continue
 
             for index, row in metadata.iterrows():
@@ -170,8 +168,6 @@ def scrape_samsara_to_gcs(
 def load_to_bigquery(
     metadata: pd.DataFrame,
     configs_for_update: dict,
-    table_names=None,
-    end_date: str = None,
 ):
     shared_vars_manager = MemoryAccess()
     shared_vars_manager.write("metadata", metadata)
@@ -183,7 +179,7 @@ def load_to_bigquery(
         dataset_id=database_id,
         memory_manager=shared_vars_manager,
         # _to=datetime.strptime(end_date, "%d/%m/%Y")
-    ).run(configs_for_update=configs_for_update, table_names=table_names)
+    ).run(configs_for_update=configs_for_update, metadata=metadata)
 
 
 def upload_logs():
@@ -239,7 +235,7 @@ if __name__ == "__main__":
         table_names = df.iloc[:, 0].tolist()
     else:
         table_names = [
-            # # EV ok
+            # EV ok
             "fleet_vehicle_stats_evAverageBatteryTemperatureMilliCelsius",
             "fleet_vehicle_stats_evBatteryStateOfHealthMilliPercent",
             "fleet_vehicle_stats_evChargingCurrentMilliAmp",
@@ -259,7 +255,19 @@ if __name__ == "__main__":
             "fleet_vehicle_stats_faultCodes",
             "fleet_safety_events",
             "fleet_assets_reefers",
-            # # # core
+            # stats
+            # Todo: add the rest of the stats to transformation configs
+            # "fleet_vehicle_stats_intakeManifoldTemperatureMilliC",
+            # "fleet_vehicle_stats_engineRpm",
+            # "fleet_vehicle_stats_engineOilPressureKPa",
+            # "fleet_vehicle_stats_engineLoadPercent",
+            # "fleet_vehicle_stats_engineImmobilizer",
+            # "fleet_vehicle_stats_engineCoolantTemperatureMilliC",
+            # "fleet_vehicle_stats_defLevelMilliPercent",
+            # "fleet_vehicle_stats_batteryMilliVolts",
+            # "fleet_vehicle_stats_barometricPressurePa",
+            # "fleet_vehicle_stats_ambientAirTemperatureMilliC"
+            # core ok
             "fleet_vehicles",
             "fleet_assets",
             "fleet_trailers",
@@ -268,7 +276,7 @@ if __name__ == "__main__":
         ]
 
     gcs_client = GCSClient(bucket_name=gcs_raw_bucket_name)
-    configs_for_update = gcs_client.get_configs_for_update()
+    configs_for_update = {} # gcs_client.get_configs_for_update()
     print(f"Table names to process avant: {configs_for_update}")
     if configs_for_update is None:
         standard_logger.error("Le fichier de conf est endommagé.")
@@ -280,6 +288,7 @@ if __name__ == "__main__":
         start_date=start_date,
         end_date=end_date,
     )
+    standard_logger.info("Metadata construite avec succès.")
     if metadata.empty:
         standard_logger.error("Aucune metadata trouvée pour les tables spécifiées.")
         exit()
@@ -312,26 +321,49 @@ if __name__ == "__main__":
 
     download_missing_files(
         configs_for_update=configs_for_update,
-        table_names=table_names,
+        metadata=metadata,
         start_date=start_date,
         end_date=end_date,
         max_workers=max_workers,
     )
-
     gcs_client.update_configs_for_update(metadata=metadata, end_time=end_date, col_to_update=ColumnToUpdate.DOWNLOAD)
 
-    # #
-    # load_to_bigquery(
-    #     metadata=metadata,
-    #     configs_for_update=configs_for_update,
-    #     table_names=table_names,
-    #     end_date=end_date,
-    # )
-    # gcs_client.update_configs_for_update(metadata=metadata, end_time=end_date, col_to_update=ColumnToUpdate.DATABASE)
-    # #
-    # upload_logs()
-    #
-    # gcs_client.update_configs_for_update(metadata=metadata, end_time=end_date, col_to_update=ColumnToUpdate.TRANSFORMATION)
+    # Récupération et sauvegarde des dates sans données dans le fichier de configuration
+    missing_dates = gcs_client.bucket_manager.missing_dates(
+        metadata=metadata,
+        configs_for_update=configs_for_update,
+        end_date=datetime.strptime(end_date, "%d/%m/%Y"),
+        start_date=datetime.strptime(start_date, "%d/%m/%Y")
+    )
+    standard_logger.info("Dates sans données récupérées avec succès.")
+    gcs_client.update_configs_for_update(
+        metadata=metadata,
+        end_time=end_date,
+        col_to_update=ColumnToUpdate.DATE_NO_DATA,
+        missing_dates=missing_dates
+    )
+    standard_logger.info("Fichier de configuration mis à jour avec les dates sans données.")
+
+    # Transformation des données
+    gcs_client.transform_and_save_data(
+        target_bucket_name=gcs_flattened_bucket_name,
+        metadata=metadata
+    )
+    gcs_client.update_configs_for_update(
+        metadata=metadata,
+        end_time=end_date,
+        col_to_update=ColumnToUpdate.TRANSFORMATION
+    )
+
+    # Chargement des données dans BigQuery
+    load_to_bigquery(
+        metadata=metadata,
+        configs_for_update=configs_for_update,
+    )
+    gcs_client.update_configs_for_update(metadata=metadata, end_time=end_date, col_to_update=ColumnToUpdate.DATABASE)
+    # Chargement des logs dans GCS
+    upload_logs()
+
     print("----------------------> Fin de l'execution <----------------------")
     configs_for_update = gcs_client.get_configs_for_update()
     print(f"Table names to process: {configs_for_update}")

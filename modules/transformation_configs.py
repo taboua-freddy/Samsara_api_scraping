@@ -1,8 +1,7 @@
 from typing import Any
 
-from modules.interface import JSONNormalizeType
-from modules.utils import reverse_mapping
-from modules.utils_transformation import SplitDFConfig
+from .interface import JSONNormalizeType, SplitDFConfig
+from .utils import reverse_mapping
 
 MAPPING_TABLES = {
     "fleet_vehicle_stats_faultCodes_obdii": "fleet_vehicle_stats_faultCodes",
@@ -25,6 +24,7 @@ MAPPING_TABLES = {
 }
 
 REVERSED_MAPPING_TABLES = reverse_mapping(MAPPING_TABLES)
+
 
 def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
     return {
@@ -70,11 +70,9 @@ def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
             get_trans_to_explode_df("faultCodes"),
             get_trans_to_json_normalize_df("faultCodes"),
             get_trans_to_cast_column_type(["time"], dtype="datetime", utc=True),
+            include_default_trans=False
         ),
         "fleet_vehicle_stats_faultCodes_obdii": index_transformations(
-            get_trans_to_rename_columns({
-                "obdii_checkEngineLightIsOn": "obdii_engine_light_on"
-            }),
             get_trans_to_explode_df("obdii_diagnosticTroubleCodes"),
             get_trans_to_json_normalize_df("obdii_diagnosticTroubleCodes", prefix="obdii_"),
             get_trans_to_explode_df("obdii_pendingDtcs"),
@@ -83,23 +81,73 @@ def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
             get_trans_to_json_normalize_df("obdii_confirmedDtcs", prefix="obdii_confirmed_"),
             get_trans_to_json_normalize_df("obdii_pendingDtcs", prefix="obdii_pending_"),
             get_trans_to_json_normalize_df("obdii_permanentDtcs", prefix="obdii_permanent_"),
-            get_trans_to_filter_df("obdii_engine_light_on.notna() or obdii_txId.notna() or obdii_confirmed_dtcId.notna() or obdii_pending_dtcId.notna() or obdii_permanent_dtcId.notna()"),
+            get_trans_to_rename_columns({
+                "obdii_checkEngineLightIsOn": "obdii_engine_light_on"
+            }),
+            get_trans_to_dropna_df([
+                "obdii_engine_light_on",
+                "obdii_txId",
+                "obdii_confirmed_dtcId",
+                "obdii_pending_dtcId",
+                "obdii_permanent_dtcId"
+            ]),
         ),
         "fleet_vehicle_stats_faultCodes_j1939": index_transformations(
+            get_trans_to_explode_df("j1939_diagnosticTroubleCodes"),
+            get_trans_to_json_normalize_df("j1939_diagnosticTroubleCodes", prefix="j1939_diag_trouble_codes_"),
             get_trans_to_rename_columns({
                 "j1939_checkEngineLights_protectIsOn": "j1939_protect_engine_light_On",
                 "j1939_checkEngineLights_warningIsOn": "j1939_warning_engine_light_On",
                 "j1939_checkEngineLights_stopIsOn": "j1939_stop_engine_light_On",
                 "j1939_checkEngineLights_emissionsIsOn": "j1939_emissions_engine_light_On",
             }),
-            get_trans_to_explode_df("j1939_diagnosticTroubleCodes"),
-            get_trans_to_json_normalize_df("j1939_diagnosticTroubleCodes", prefix="j1939_diag_trouble_codes_"),
-            get_trans_to_filter_df("j1939_emissions_engine_light_On.notna() or j1939_protect_engine_light_On.notna() or j1939_stop_engine_light_On.notna() or j1939_warning_engine_light_On.notna() or j1939_diag_trouble_codes_spnId.notna() or j1939_diag_trouble_codes_fmiId.notna()"),
+            get_trans_to_dropna_df([
+                "j1939_protect_engine_light_On",
+                "j1939_warning_engine_light_On",
+                "j1939_stop_engine_light_On",
+                "j1939_emissions_engine_light_On",
+                "j1939_diag_trouble_codes_spnId",
+                "j1939_diag_trouble_codes_fmiId"
+            ]),
+        ),
+        "fleet_vehicle_stats_intakeManifoldTemperatureMilliC": get_standard_transformation_config(
+            "intakeManifoldTemperatureMilliC"
+        ),
+        "fleet_vehicle_stats_engineRpm": get_standard_transformation_config(
+            "engineRpm"
+        ),
+        "fleet_vehicle_stats_engineOilPressureKPa": get_standard_transformation_config(
+            "engineOilPressureKPa"
+        ),
+        "fleet_vehicle_stats_engineLoadPercent": get_standard_transformation_config(
+            "engineLoadPercent"
+        ),
+        "fleet_vehicle_stats_engineImmobilizer": index_transformations(
+            get_trans_to_explode_df("engineImmobilizer"),
+            get_trans_to_json_normalize_df("engineImmobilizer", prefix="engine_immobilizer_"),
+            get_trans_to_rename_columns({
+                "engine_immobilizer_time": "time"
+            }),
+        ),
+        "fleet_vehicle_stats_engineCoolantTemperatureMilliC": get_standard_transformation_config(
+            "engineCoolantTemperatureMilliC"
+        ),
+        "fleet_vehicle_stats_defLevelMilliPercent": get_standard_transformation_config(
+            "defLevelMilliPercent"
+        ),
+        "fleet_vehicle_stats_batteryMilliVolts": get_standard_transformation_config(
+            "batteryMilliVolts"
+        ),
+        "fleet_vehicle_stats_barometricPressurePa": get_standard_transformation_config(
+            "barometricPressurePa"
+        ),
+        "fleet_vehicle_stats_ambientAirTemperatureMilliC": get_standard_transformation_config(
+            "ambientAirTemperatureMilliC"
         ),
         # split des tables
         "fleet_vehicle_stats_faultCodes_split": index_transformations(
             get_trans_to_split_df(
-                shared_cols=["vehicle_id", "parc_id", "time", "canBusType"],
+                shared_cols=["id", "name", "time", "canBusType"],
                 split_configs={
                     "fleet_vehicle_stats_faultCodes_obdii": {
                         "prefix": "obdii_",
@@ -108,7 +156,6 @@ def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
                         "prefix": "j1939_",
                     },
                 },
-                drop_duplicates=True,
             ),
             include_default_trans=False
         ),
@@ -170,7 +217,7 @@ def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
         ),
         "fleet_devices_split": index_transformations(
             get_trans_to_split_df(
-                shared_cols=["asset_id", "asset_name", ],
+                shared_cols=["asset_id", "asset_name"],
                 split_configs={
                     "fleet_devices_healthReasons": {
                         "columns": ["health_healthReasons"],
@@ -189,7 +236,8 @@ def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
                         "prefix": "health_",
                     }
                 }
-            )
+            ),
+            include_default_trans=False
         ),
         # "": get_standard_transformation_config(),
         "fleet_safety_events": index_transformations(
@@ -203,57 +251,95 @@ def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
             get_trans_to_explode_df("ReeferStats_engineHours"),
             get_trans_to_json_normalize_df("ReeferStats_engineHours"),
             get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
-            get_trans_to_rename_columns({"changedAtMs": "engineHoursChangedAt"}),
+            get_trans_to_dropna_df(["changedAtMs"]),
+            get_trans_to_drop_duplicates_df(subset=["id", "changedAtMs"]),
+            get_trans_to_rename_columns({
+                "changedAtMs": "engineHoursChangedAt",
+                "id": "asset_id",
+                "name": "asset_name"
+            }),
+            include_default_trans=False
         ),
         "ReeferStats_fuelPercentage": index_transformations(
             get_trans_to_explode_df("ReeferStats_fuelPercentage"),
             get_trans_to_json_normalize_df("ReeferStats_fuelPercentage"),
             get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
-            get_trans_to_rename_columns({"changedAtMs": "fuelPercentageChangedAt"}),
+            get_trans_to_dropna_df(["changedAtMs"]),
+            get_trans_to_drop_duplicates_df(subset=["id", "changedAtMs"]),
+            get_trans_to_rename_columns({
+                "changedAtMs": "fuelPercentageChangedAt",
+                "id": "asset_id",
+                "name": "asset_name"
+            }),
+            include_default_trans=False
         ),
         "ReeferStats_returnAirTemperature": index_transformations(
             get_trans_to_explode_df("ReeferStats_returnAirTemperature"),
             get_trans_to_json_normalize_df("ReeferStats_returnAirTemperature"),
             get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
+            get_trans_to_dropna_df(["changedAtMs", "tempInMilliC"]),
+            get_trans_to_drop_duplicates_df(subset=["id", "changedAtMs"]),
             get_trans_to_rename_columns({
                 "changedAtMs": "returnAirTemperatureChangedAt",
-                "tempInMilliC": "returnAirTemperatureMilliCelsius"
+                "tempInMilliC": "returnAirTemperatureMilliCelsius",
+                "id": "asset_id",
+                "name": "asset_name"
             }),
+            include_default_trans=False
         ),
         "ReeferStats_ambientAirTemperature": index_transformations(
             get_trans_to_explode_df("ReeferStats_ambientAirTemperature"),
             get_trans_to_json_normalize_df("ReeferStats_ambientAirTemperature"),
             get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
+            get_trans_to_dropna_df(["changedAtMs", "tempInMilliC"]),
+            get_trans_to_drop_duplicates_df(subset=["id", "changedAtMs"]),
             get_trans_to_rename_columns({
                 "changedAtMs": "ambientAirTemperatureChangedAt",
-                "tempInMilliC": "ambientAirTemperatureMilliCelsius"
+                "tempInMilliC": "ambientAirTemperatureMilliCelsius",
+                "id": "asset_id",
+                "name": "asset_name"
             }),
+            include_default_trans=False
         ),
         "ReeferStats_dischargeAirTemperature": index_transformations(
             get_trans_to_explode_df("ReeferStats_dischargeAirTemperature"),
             get_trans_to_json_normalize_df("ReeferStats_dischargeAirTemperature"),
             get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
+            get_trans_to_dropna_df(["changedAtMs", "tempInMilliC"]),
+            get_trans_to_drop_duplicates_df(subset=["id", "changedAtMs"]),
             get_trans_to_rename_columns({
                 "changedAtMs": "dischargeAirTemperatureChangedAt",
-                "tempInMilliC": "dischargeAirTemperatureMilliCelsius"
+                "tempInMilliC": "dischargeAirTemperatureMilliCelsius",
+                "id": "asset_id",
+                "name": "asset_name"
             }),
+            include_default_trans=False
         ),
         "ReeferStats_setPoint": index_transformations(
             get_trans_to_explode_df("ReeferStats_setPoint"),
             get_trans_to_json_normalize_df("ReeferStats_setPoint"),
             get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
+            get_trans_to_dropna_df(["changedAtMs", "tempInMilliC"]),
+            get_trans_to_drop_duplicates_df(subset=["id", "changedAtMs"]),
             get_trans_to_rename_columns({
                 "changedAtMs": "setPointChangedAt",
-                "tempInMilliC": "setPointMilliCelsius"
+                "tempInMilliC": "setPointMilliCelsius",
+                "id": "asset_id",
+                "name": "asset_name"
             }),
+            include_default_trans=False
         ),
         "ReeferStats_powerStatus": index_transformations(
             get_trans_to_explode_df("ReeferStats_powerStatus"),
             get_trans_to_json_normalize_df("ReeferStats_powerStatus"),
             get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
+            get_trans_to_dropna_df(["changedAtMs"]),
+            get_trans_to_drop_duplicates_df(subset=["id", "changedAtMs"]),
             get_trans_to_rename_columns({
                 "changedAtMs": "powerStatusChangedAt",
-                "status": "powerStatus"
+                "status": "powerStatus",
+                "id": "asset_id",
+                "name": "asset_name"
             }),
         ),
         "ReeferStats_reeferAlarms": index_transformations(
@@ -262,7 +348,13 @@ def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
             get_trans_timestamp_to_datetime("changedAtMs", unit="ms"),
             get_trans_to_explode_df("alarms"),
             get_trans_to_json_normalize_df("alarms", prefix="alarm_"),
-            get_trans_to_rename_columns({"changedAtMs": "reeferAlarmsChangedAt"}),
+            get_trans_to_dropna_df(["alarm_alarmCode"]),
+            get_trans_to_drop_duplicates_df(subset=["id", "changedAtMs"]),
+            get_trans_to_rename_columns({
+                "changedAtMs": "reeferAlarmsChangedAt",
+                "id": "asset_id",
+                "name": "asset_name"
+            }),
         ),
         # Non temporel
         "fleet_vehicles": index_transformations(
@@ -319,6 +411,7 @@ def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
         ),
     }
 
+
 def get_standard_transformation_config(column_name: str, current_index=0) -> dict[int, dict]:
     """
     Fonction de configuration standard pour les transformations de données
@@ -336,7 +429,9 @@ def get_standard_transformation_config(column_name: str, current_index=0) -> dic
         current_index=current_index
     )
 
-def get_trans_to_split_df(shared_cols: list[str], split_configs: SplitDFConfig, drop_duplicates: bool = False, subset = None):
+
+def get_trans_to_split_df(shared_cols: list[str], split_configs: SplitDFConfig, drop_duplicates: bool = False,
+                          subset=None):
     return {
         "type_function": "is_custom_function",
         "function": "split_dataframe",
@@ -346,16 +441,18 @@ def get_trans_to_split_df(shared_cols: list[str], split_configs: SplitDFConfig, 
         }
     }
 
+
 def get_trans_to_drop_duplicates_df(subset=None) -> dict:
     return {
         "type_function": "is_custom_function",
-        "function": "drop_duplicates",
+        "function": "drop_duplicates_df",
         "kwargs": {"subset": subset},
     }
 
+
 def get_trans_to_default_trans() -> list[dict]:
     return [
-        get_trans_to_rename_columns({"id": "vehicle_id", "name": "parc_id"}), # "id": "samsara_id",
+        get_trans_to_rename_columns({"id": "vehicle_id", "name": "parc_id"}),  # "id": "samsara_id",
         get_trans_to_drop_columns([
             "externalIds_samsara_serial",
             "externalIds_samsara_vin",
@@ -366,25 +463,30 @@ def get_trans_to_default_trans() -> list[dict]:
         get_trans_to_drop_duplicates_df()
     ]
 
-def get_trans_to_cast_column_type(columns:list[str], dtype, format:str | None = None, utc=False) -> dict:
+
+def get_trans_to_cast_column_type(columns: list[str], dtype, format: str | None = None, utc=False) -> dict:
     return {
         "type_function": "is_custom_function",
         "function": "cast_column",
         "kwargs": {"columns": columns, "dtype": dtype, "format": format, "utc": utc},
     }
-def get_trans_to_set_df_column(column_name:str, value:Any) -> dict:
+
+
+def get_trans_to_set_df_column(column_name: str, value: Any) -> dict:
     return {
         "type_function": "is_custom_function",
         "function": "set_column",
         "kwargs": {"col_name": column_name, "value": f"{value}"},
     }
 
+
 def get_trans_to_drop_columns(columns: list) -> dict:
     return {
         "type_function": "is_df_function",
         "function": "drop",
-        "kwargs":  {"columns": columns, "errors": "ignore"},
+        "kwargs": {"columns": columns, "errors": "ignore"},
     }
+
 
 def get_trans_to_rename_columns(new_columns: dict) -> dict:
     return {
@@ -393,12 +495,14 @@ def get_trans_to_rename_columns(new_columns: dict) -> dict:
         "kwargs": {"columns": new_columns, "errors": "ignore"},
     }
 
+
 def get_trans_to_explode_df(column_name: str, ignore_index: bool = True) -> dict:
     return {
-        "type_function": "is_df_function",
+        "type_function": "is_custom_function",
         "function": "explode",
         "kwargs": {"column": column_name, "ignore_index": ignore_index},
     }
+
 
 def get_trans_timestamp_to_datetime(column_name: str, unit=None) -> dict:
     return {
@@ -407,28 +511,48 @@ def get_trans_timestamp_to_datetime(column_name: str, unit=None) -> dict:
         "kwargs": {"columns": [column_name], "unit": unit},
     }
 
-def get_trans_to_json_normalize_df(column_name: str, record_path: str=None, sep: str = "_", prefix: str | None = "", record_prefix=None, function: JSONNormalizeType = JSONNormalizeType.JSON_NORMALIZE) -> dict:
+
+def get_trans_to_json_normalize_df(column_name: str, record_path: str = None, sep: str = "_", prefix: str | None = "",
+                                   record_prefix=None,
+                                   function: JSONNormalizeType = JSONNormalizeType.JSON_NORMALIZE) -> dict:
     if record_path is None:
         record_path = column_name
     return {
         "column_name": column_name,
         "type_function": "is_custom_function",
         "function": f"{function.value if isinstance(function, JSONNormalizeType) else function}",
-        "kwargs": {"sep": sep, "record_path": record_path, "prefix": prefix, "record_prefix": record_prefix}, #
+        "kwargs": {"sep": sep, "record_path": record_path, "prefix": prefix, "record_prefix": record_prefix},  #
     }
+
+
 def index_transformations(*transformations, current_index: int = 0, include_default_trans=True) -> dict[int, dict]:
     if include_default_trans:
         transformations = list(transformations) + get_trans_to_default_trans()
     return {index: trans for index, trans in enumerate(transformations, start=current_index + 1)}
 
-def get_trans_to_filter_df(query: str) -> dict:
+
+def get_trans_to_filter_df(query: str, fields_to_check: list[str] | None = None) -> dict:
     """
     Crée une transformation pour filtrer un DataFrame en fonction d'une requête.
+    :param fields_to_check: liste des champs à vérifier l'existance dans la requête
     :param query: requête de filtrage
     :return: dictionnaire de transformation
     """
     return {
         "type_function": "is_custom_function",
         "function": "filter_df",
-        "kwargs": {"query": query},
+        "kwargs": {"query": query, "fields_to_check": fields_to_check},
+    }
+
+
+def get_trans_to_dropna_df(columns: list[str] | None = None) -> dict:
+    """
+    Crée une transformation pour supprimer les lignes contenant des valeurs NaN dans les colonnes spécifiées.
+    :param columns: liste des colonnes à vérifier pour les valeurs NaN
+    :return: dictionnaire de transformation
+    """
+    return {
+        "type_function": "is_custom_function",
+        "function": "dropna_df",
+        "kwargs": {"columns": columns},
     }
