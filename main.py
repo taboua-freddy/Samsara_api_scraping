@@ -1,20 +1,17 @@
-import json
-import logging
+
 import os
 from datetime import datetime
-from logging import exception
 
 import pandas as pd
 from dotenv import load_dotenv
 import argparse
 
-from maintenance_predictive.Samsara_api_scraping.modules.interface import DownloadType
+from modules.interface import DownloadType
 from modules.interface import ColumnToUpdate
 from modules.metadata import get_metadata, build_metadata
 from modules.transformation_configs import MAPPING_TABLES
 from modules.utils import (
     CREDENTIALS_DIR,
-    parquet_buffer,
     get_start_end_date_config,
     process_params,
     DATA_DIR,
@@ -220,7 +217,7 @@ if __name__ == "__main__":
     table_file_path = args.table_file_path
 
     # start_date = "01/02/2024"
-    # end_date = "02/02/2024"
+    end_date = "05/06/2025"
 
     if end_date is None:
         end_date = datetime.now().strftime("%d/%m/%Y")
@@ -255,28 +252,28 @@ if __name__ == "__main__":
             "fleet_vehicle_stats_faultCodes",
             "fleet_safety_events",
             "fleet_assets_reefers",
+            "fleet_vehicle_idling",
             # stats
-            # Todo: add the rest of the stats to transformation configs
-            # "fleet_vehicle_stats_intakeManifoldTemperatureMilliC",
-            # "fleet_vehicle_stats_engineRpm",
-            # "fleet_vehicle_stats_engineOilPressureKPa",
-            # "fleet_vehicle_stats_engineLoadPercent",
-            # "fleet_vehicle_stats_engineImmobilizer",
-            # "fleet_vehicle_stats_engineCoolantTemperatureMilliC",
-            # "fleet_vehicle_stats_defLevelMilliPercent",
-            # "fleet_vehicle_stats_batteryMilliVolts",
-            # "fleet_vehicle_stats_barometricPressurePa",
-            # "fleet_vehicle_stats_ambientAirTemperatureMilliC"
+            "fleet_vehicle_stats_intakeManifoldTemperatureMilliC",
+            "fleet_vehicle_stats_engineRpm",
+            "fleet_vehicle_stats_engineOilPressureKPa",
+            "fleet_vehicle_stats_engineLoadPercent",
+            "fleet_vehicle_stats_engineImmobilizer",
+            "fleet_vehicle_stats_engineCoolantTemperatureMilliC",
+            "fleet_vehicle_stats_defLevelMilliPercent",
+            "fleet_vehicle_stats_batteryMilliVolts",
+            "fleet_vehicle_stats_barometricPressurePa",
+            "fleet_vehicle_stats_ambientAirTemperatureMilliC",  # ok
             # core ok
-            "fleet_vehicles",
-            "fleet_assets",
-            "fleet_trailers",
-            "fleet_tags",
-            "fleet_devices",
+            "fleet_vehicles",  # ok
+            "fleet_assets",  # ok
+            "fleet_trailers",  # ok
+            "fleet_tags",  # ok
+            "fleet_devices",  # ok
         ]
 
     gcs_client = GCSClient(bucket_name=gcs_raw_bucket_name)
-    configs_for_update = {} # gcs_client.get_configs_for_update()
+    configs_for_update = gcs_client.get_configs_for_update()
     print(f"Table names to process avant: {configs_for_update}")
     if configs_for_update is None:
         standard_logger.error("Le fichier de conf est endommagé.")
@@ -347,23 +344,30 @@ if __name__ == "__main__":
     # Transformation des données
     gcs_client.transform_and_save_data(
         target_bucket_name=gcs_flattened_bucket_name,
-        metadata=metadata
+        metadata=metadata,
+        configs_for_update=configs_for_update,
     )
+    # standard_logger.info("Transformation des données effectuée avec succès.")
     gcs_client.update_configs_for_update(
         metadata=metadata,
         end_time=end_date,
         col_to_update=ColumnToUpdate.TRANSFORMATION
     )
+    standard_logger.info("Fichier de configuration mis à jour avec les données transformées.")
 
     # Chargement des données dans BigQuery
     load_to_bigquery(
         metadata=metadata,
         configs_for_update=configs_for_update,
     )
+    standard_logger.info("Chargement des données dans BigQuery effectué avec succès.")
     gcs_client.update_configs_for_update(metadata=metadata, end_time=end_date, col_to_update=ColumnToUpdate.DATABASE)
+    standard_logger.info("Fichier de configuration mis à jour avec les données chargées dans BigQuery.")
+
     # Chargement des logs dans GCS
     upload_logs()
+    standard_logger.info("Logs chargés dans GCS avec succès.")
 
     print("----------------------> Fin de l'execution <----------------------")
     configs_for_update = gcs_client.get_configs_for_update()
-    print(f"Table names to process: {configs_for_update}")
+    # print(f"Table names to process: {configs_for_update}")

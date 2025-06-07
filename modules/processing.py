@@ -22,7 +22,7 @@ from .utils import (
     timestamp_ms_to_timestamp,
     DEFAULT_RATE_LIMIT_SECOND,
     split_list,
-    extract_suffixe, DATA_DIR,
+    DATA_DIR,
 )
 from .utils_transformation import *
 
@@ -317,9 +317,9 @@ class DataFetcher:
                     ),
                 )
 
-                date_str = datetime.now().strftime("%Y_%m_%d")
-                file_name = f'{self.endpoint_info.get("table_name")}_{date_str}'
-                self._flatten_and_upload(data, file_name, date_str)
+                # date_str = datetime.now().strftime("%Y_%m_%d")
+                file_name = f'{self.endpoint_info.get("table_name")}' # _{date_str}
+                self._flatten_and_upload(data, file_name, date_str="")
 
     def _fetch_data_for_interval(self, **kwargs):
         # params: dict, start_time: str, end_time: str

@@ -7,8 +7,7 @@ from io import BytesIO
 from typing import Literal
 import os
 import pyarrow.parquet as pq
-import pyarrow as pa
-import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 from google.cloud import storage, bigquery
@@ -43,8 +42,8 @@ class BucketManager:
         self.file_path_regex = re.compile(
             r"^(?P<family>[^/]+)/"
             r"(?P<main_family>[^/]+)/"
-            r"(?P<table_name>.+?)_"
-            r"(?P<start_date>\d{4}_\d{2}_\d{2})"
+            r"(?P<table_name>.+?)"
+            r"(?:_(?P<start_date>\d{4}_\d{2}_\d{2}))?"
             r"(?:_to_(?P<end_date>\d{4}_\d{2}_\d{2}))?"
             r"(?:_(?P<index>\d+))?"
             r"\.parquet$"
@@ -127,6 +126,8 @@ class BucketManager:
     def list_parquet_files(self, input_folder: str = None) -> list[str]:
         """Lister les fichiers Parquet dans le bucket GCS."""
         self.logger.info(f"Listing Parquet files in bucket: {self.bucket_name}")
+        if input_folder:
+            input_folder = input_folder if input_folder.endswith("/") else input_folder + "/"
         files = [
             blob.name
             for blob in self.bucket.list_blobs(prefix=input_folder)
@@ -327,7 +328,7 @@ class BigQueryManager:
         )  # Durée de conservation des partitions
         self.partition_expiration_ms = int(timedelta(days=self.partition_expiration_days).total_seconds() * 1000)
 
-    def load_parquet_to_bigquery(self, uri: list[str], table_name: str) -> None:
+    def load_parquet_to_bigquery(self, uri: str, table_name: str) -> tuple[str, bigquery.LoadJob] | tuple[str, Exception]:
         """Charger un fichier Parquet de GCS vers BigQuery."""
         table_id = f"{self.bigquery_client.project}.{self.dataset_id}.{table_name}"
 
@@ -352,11 +353,11 @@ class BigQueryManager:
             self.logger.info(f"Dataset '{self.dataset_id}' created successfully.")
 
         # gestion du cas où on charge tous les fichiers d'un dossier il faut supprimer la table afin de ne pas avoir de doublon
-        if len(uri) == 1 and uri[0].endswith("/*"):
-            self.logger.info(
-                f"Deleting existing table (if any): {table_id} before loading files from {uri[0]}"
-            )
-            self.bigquery_client.delete_table(table_id, not_found_ok=True)
+        # if len(uri) == 1 and uri[0].endswith("/*"):
+        #     self.logger.info(
+        #         f"Deleting existing table (if any): {table_id} before loading files from {uri[0]}"
+        #     )
+        #     self.bigquery_client.delete_table(table_id, not_found_ok=True)
 
         # Configurer la source GCS et l'opération de chargement
         default_write_disposition = bigquery.WriteDisposition.WRITE_APPEND
@@ -428,20 +429,19 @@ class BigQueryManager:
             load_job = self.bigquery_client.load_table_from_uri(
                 uri, table_id, job_config=job_config
             )
+            return (uri, load_job)
             # Attendre la fin du job
-            result = load_job.result()
-            if result.errors:
-                self.logger.error(
-                    f"Errors occurred while loading files into BigQuery table '{table_name}': {load_job.result().errors}"
-                )
-            if result.done() > 0:
-                self.logger.info(
-                    f"Table '{table_name}' successfully updated in BigQuery with files from {uri}."
-                )
+            # result = load_job.result()
+            # if result.errors:
+            #     self.logger.error(
+            #         f"Errors occurred while loading files into BigQuery table '{table_name}': {load_job.errors}"
+            #     )
+            # if result.done() > 0:
+            #     self.logger.info(
+            #         f"Table '{table_name}' successfully updated in BigQuery with files from {uri}."
+            #     )
         except Exception as e:
-            self.logger.error(
-                f"Error loading files into BigQuery table '{table_name}': {e}"
-            )
+            return (uri, e)
 
     def get_table_schema(self, table_name: str) -> list[bigquery.SchemaField] | None:
         """
@@ -615,13 +615,14 @@ class GCSClient:
         # Enregistre les configurations mises à jour dans le bucket GCS.
         self._update_config(data, "configs_for_update", erase=False)
 
-    def transform_and_save_data(self, target_bucket_name: str, metadata: pd.DataFrame) -> None:
+    def transform_and_save_data(self, target_bucket_name: str, metadata: pd.DataFrame, configs_for_update: dict) -> None:
         """
         Transforme les données et les télécharge dans un bucket GCS.
 
         Args:
             target_bucket_name (str): Nom du bucket cible pour le téléchargement.
             metadata (pd.DataFrame): DataFrame contenant les métadonnées des tables.
+            configs_for_update (dict): Dictionnaire de configurations pour la mise à jour des tables.
 
         Returns:
             None: Cette méthode ne retourne rien, elle effectue des transformations et des téléchargements.
@@ -632,8 +633,11 @@ class GCSClient:
         for index, row in metadata.iterrows():
             table_name = row.get("table_name")
             family = row.get("family")
+            if not table_name or not family:
+                continue
             input_folder = family + "/" + table_name
             files = self.bucket_manager.list_parquet_files(input_folder=input_folder)
+
             self.bucket_manager.logger.info(
                 f"Found {len(files)} files for table {table_name} in bucket {self.bucket_manager.bucket_name}"
             )
@@ -643,7 +647,17 @@ class GCSClient:
                 "input_folder": input_folder,
                 "folder_path": input_folder,
             }
-            for file_path in files[:1]:
+
+            download_type = row.get("download_type", DownloadType.TIME.value)
+            last_transform_date = configs_for_update.get(MAPPING_TABLES.get(table_name, table_name), {}).get(ColumnToUpdate.TRANSFORMATION.value, None)
+            for file_path in files[:6]:
+                if download_type == DownloadType.TIME.value and last_transform_date:
+                    start_date = self.bucket_manager.get_start_date(file_path)
+                    if start_date and start_date < datetime.strptime(last_transform_date, "%d/%m/%Y"):
+                        continue
+                    end_date = self.bucket_manager.get_end_date(file_path)
+                    if end_date and end_date < datetime.strptime(last_transform_date, "%d/%m/%Y"):
+                        continue
                 tasks.append(
                     {
                         "file_path": file_path,
@@ -681,7 +695,7 @@ class GCSClient:
             suffixe = extract_suffixe(file_name)
             for table, table_df in dfs.items():
                 if not table_df.empty:
-                    file_name = f'{table}_{suffixe}'
+                    file_name = f'{table}_{suffixe}' if suffixe else table
                     # table_df.to_json(f'{TMP_DIR}/{file_name}.json', orient='records', lines=False)
                     destination_blob_name = f'{endpoint_info.get("folder_path")}/{file_name}.parquet'
                     buffer = parquet_buffer(table_df)
@@ -699,67 +713,59 @@ class GCSBigQueryLoader:
         self.logger: MyLogger = MyLogger("GCSBigQueryLoader", with_console=False)
         self._from: datetime | None = kwargs.get("_from", None)
         self._to: datetime | None = kwargs.get("_to", None)
-        self.max_workers = 2
+        self.max_workers = 32
         self.memory_manager: MemoryAccess | None = kwargs.get("memory_manager")
 
     def run(
             self, configs_for_update: dict, metadata: pd.DataFrame | None = None
     ) -> None:
         """Exécuter le processus de chargement pour tous les fichiers Parquet."""
-        table_to_paths = defaultdict(list)
-        for _, row in metadata.iterrows():
-            table_name = row.get("table_name")
-            if not table_name:
-                continue
-            family = row.get("family")
-            if not family:
-                continue
-            input_folder = f"{family}/{table_name}"
-            files = self.bucket_manager.list_parquet_files(input_folder=input_folder)
+        futures = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            table_to_paths = defaultdict(list)
+            for _, row in metadata.iterrows():
+                table_name = row.get("table_name")
+                if not table_name:
+                    continue
+                family = row.get("family")
+                if not family:
+                    continue
+                input_folder = f"{family}/{table_name}"
+                files = self.bucket_manager.list_parquet_files(input_folder=input_folder)
 
-            # Grouper les fichiers par table (en fonction du chemin)
-            for file_path in files:
-                table_name = self.bucket_manager.get_table_name(file_path)
-                start_date = self.bucket_manager.get_start_date(file_path)
-                if self._from:
-                    if start_date and start_date < self._from:
-                        continue
-                if self._to:
-                    end_date = self.bucket_manager.get_end_date(file_path) or start_date
-                    if end_date and end_date > self._to:
-                        continue
-                if configs := configs_for_update.get(
-                        MAPPING_TABLES.get(table_name, table_name), {}
-                ):
-                    if last_update_time := configs.get(ColumnToUpdate.DATABASE.value, None):
-                        last_update_date = datetime.strptime(last_update_time, "%d/%m/%Y")
-                        if start_date < last_update_date:
+                # Grouper les fichiers par table (en fonction du chemin)
+                for file_path in files:
+                    table_name = self.bucket_manager.get_table_name(file_path)
+                    start_date = self.bucket_manager.get_start_date(file_path)
+                    if self._from:
+                        if start_date and start_date < self._from:
                             continue
+                    if self._to:
+                        end_date = self.bucket_manager.get_end_date(file_path) or start_date
+                        if end_date and end_date > self._to:
+                            continue
+                    if configs := configs_for_update.get(
+                            MAPPING_TABLES.get(table_name, table_name), {}
+                    ):
+                        if last_update_date := configs.get(ColumnToUpdate.DATABASE.value, None):
+                            if start_date < datetime.strptime(last_update_date, "%d/%m/%Y"):
+                                continue
 
-                table_to_paths[table_name].append(file_path)
+                    futures.append(
+                        executor.submit(
+                            self.bigquery_manager.load_parquet_to_bigquery,
+                            **{
+                                "uri":f"gs://{self.bucket_name}/{file_path}",
+                                "table_name": table_name
+                            },
+                        )
+                    )
+                    table_to_paths[table_name].append(file_path)
 
-        tasks = []
-        for table_name, file_paths in table_to_paths.items():
-            # if configs := configs_for_update.get(MAPPING_TABLES.get(table_name, table_name), {}):
-            #     if configs.get("download_type", None) == "oneshot":
-            #         self.bigquery_manager.bigquery_client.delete_table(table_name, not_found_ok=True)
-            # si supérieur à 100 fichiers, on suppose qu'il ne s'agit pas d'une MAJ mais d'une première insertion donc on regroupe par dossier
-            # TODO: Point of failure, si plus de 50 fichiers, risque de charger toutes les données avec l'historique
-            if len(file_paths) > 50:
-                file_path = file_paths[0]
-                folder_path = "/".join(file_path.split("/")[:-1])
-                uris = [f"gs://{self.bucket_name}/{folder_path}/*"]
-                tasks.append({"uri": list(set(uris)), "table_name": table_name})
-            else:
-                uris = [
-                    f"gs://{self.bucket_name}/{file_path}" for file_path in file_paths
-                ]
-                tasks.append({"uri": list(set(uris)), "table_name": table_name})
-                # tasks.extend([{'uri': f"gs://{self.bucket_name}/{file_path}", 'table_name': table_name} for file_path in uris])
-
-        parallelize_execution(
-            tasks=tasks,
-            func=self.bigquery_manager.load_parquet_to_bigquery,
-            logger=self.logger,
-            max_workers=self.max_workers,
-        )
+            # Attendre que toutes les tâches soient terminées
+            for future in as_completed(futures):
+                uri, result = future.result()
+                if isinstance(result, Exception):
+                    self.logger.error(f"[x] Échec du job pour pour l'uri {uri} : {result}")
+                else:
+                    self.logger.info(f"[ok] Job soumis à bigquery pour {uri}")

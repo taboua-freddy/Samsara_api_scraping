@@ -1,6 +1,6 @@
 import pandas as pd
 
-from maintenance_predictive.Samsara_api_scraping.modules.transformation_configs import transformation_configs
+from .transformation_configs import transformation_configs
 from .logs import MyLogger
 
 from .utils_transformation import *
@@ -74,9 +74,9 @@ class TransformData:
             n_configs = len(config)
             for step, step_config in config.items():
                 function_name = step_config.get("function")
-                self.logger.info(
-                    f"Transformation étape: {step}/{n_configs} - Table: {self.endpoint_info.get('table_name')} - Fonction: {function_name}"
-                )
+                # self.logger.info(
+                #     f"Transformation étape: {step}/{n_configs} - Table: {self.endpoint_info.get('table_name')} - Fonction: {function_name}"
+                # )
                 if step_config.get("type_function") == "is_df_function":
                     function = getattr(self.df, function_name)
                     self.df = function(**step_config.get("kwargs", {}))

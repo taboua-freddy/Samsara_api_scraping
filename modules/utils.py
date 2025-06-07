@@ -48,9 +48,9 @@ def reverse_mapping(mapping: dict[str, str]) -> dict[str, list[str]]:
 
 def extract_suffixe(filename: str) -> str | None:
     """Extrait le suffixe d'un nom de fichier au format
-    - 'fleet_drivers_2024_12_22.parquet' -> '2024_12_22'
-    - 'fleet_drivers_2024_12_22_to_2024_12_25.parquet' -> '2024_12_22_to_2024_12_25'
-    - 'fleet_drivers_2024_12_22_to_2024_12_25_02.parquet' -> '2024_12_22_to_2024_12_25_02'
+    - 'fleet_drivers_2024_12_22.parquet' -> '2024_12_22.parquet'
+    - 'fleet_drivers_2024_12_22_to_2024_12_25.parquet' -> '2024_12_22_to_2024_12_25.parquet'
+    - 'fleet_drivers_2024_12_22_to_2024_12_25_02.parquet' -> '2024_12_22_to_2024_12_25_02.parquet'
     :param filename: nom du fichier
     :return: suffixe du nom de fichier ou None si le format n'est pas respecté
     """

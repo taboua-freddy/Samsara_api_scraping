@@ -86,7 +86,8 @@ def json_normalize(
     Returns:
         pd.DataFrame: un DataFrame aplati.
     """
-
+    if record_path not in df.columns:
+        raise ValueError(f"Le chemin d'enregistrement '{record_path}' n'existe pas dans le DataFrame.")
     if meta_cols is None:
         meta_cols = [col for col in df.columns if col != record_path]
 
