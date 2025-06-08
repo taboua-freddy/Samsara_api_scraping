@@ -62,9 +62,9 @@ class TransformData:
         :return:
         """
         if self.except_table_names and self.endpoint_info.get('table_name') in self.except_table_names:
-            self.logger.info(
-                f"Transformation ignorée pour la table {self.endpoint_info.get('table_name')}"
-            )
+            # self.logger.info(
+            #     f"Transformation ignorée pour la table {self.endpoint_info.get('table_name')}"
+            # )
             return self.df
         config = self._get_transform_config()
         function_name = "Unknown"

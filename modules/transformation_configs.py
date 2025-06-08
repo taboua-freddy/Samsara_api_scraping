@@ -67,10 +67,12 @@ def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
             get_trans_to_cast_column_type(["date"], dtype="datetime", utc=True),
         ),
         "fleet_vehicle_idling": index_transformations(
+            get_trans_to_cast_column_type(["startTime", "endTime"], dtype="datetime", utc=True),
             get_trans_to_rename_columns({
                 "vehicle_name": "name",
                 "vehicle_id": "id",
-            })
+            }),
+            get_trans_to_dropna_df(["address_formatted"]),
         ),
         "fleet_vehicle_stats_faultCodes": index_transformations(
             get_trans_to_explode_df("faultCodes"),

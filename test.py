@@ -22,6 +22,8 @@ database_id = os.getenv('DWH_ID')
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials/maintenance-predictive-445011-fb98a59d6aa3.json"
 
 if __name__ == "__main__":
+    print(pd.to_datetime("2021-10-31T10:00:11.829Z", utc=True))
+    exit()
     # configs = transformation_configs()
     # # save configs to json file
     # with open("resources/data/transformation_configs.json", "w") as f:

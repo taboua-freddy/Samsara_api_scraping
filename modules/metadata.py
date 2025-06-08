@@ -520,6 +520,7 @@ def make_meta_data(
             "exception_config": {},
             'delta_days': 1,
             "download_type": "time",
+            "time_partitioning_field": "startTime",
             "clustering_fields": [f"{samsara_vehicle_id}"],
         },
         {

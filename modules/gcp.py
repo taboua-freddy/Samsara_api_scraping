@@ -650,7 +650,7 @@ class GCSClient:
 
             download_type = row.get("download_type", DownloadType.TIME.value)
             last_transform_date = configs_for_update.get(MAPPING_TABLES.get(table_name, table_name), {}).get(ColumnToUpdate.TRANSFORMATION.value, None)
-            for file_path in files[:6]:
+            for file_path in files:
                 if download_type == DownloadType.TIME.value and last_transform_date:
                     start_date = self.bucket_manager.get_start_date(file_path)
                     if start_date and start_date < datetime.strptime(last_transform_date, "%d/%m/%Y"):
@@ -732,7 +732,7 @@ class GCSBigQueryLoader:
                     continue
                 input_folder = f"{family}/{table_name}"
                 files = self.bucket_manager.list_parquet_files(input_folder=input_folder)
-
+                files.reverse() # priviégier le schema des fichiers les plus récents
                 # Grouper les fichiers par table (en fonction du chemin)
                 for file_path in files:
                     table_name = self.bucket_manager.get_table_name(file_path)
@@ -748,7 +748,7 @@ class GCSBigQueryLoader:
                             MAPPING_TABLES.get(table_name, table_name), {}
                     ):
                         if last_update_date := configs.get(ColumnToUpdate.DATABASE.value, None):
-                            if start_date < datetime.strptime(last_update_date, "%d/%m/%Y"):
+                            if start_date and start_date < datetime.strptime(last_update_date, "%d/%m/%Y"):
                                 continue
 
                     futures.append(
@@ -768,4 +768,5 @@ class GCSBigQueryLoader:
                 if isinstance(result, Exception):
                     self.logger.error(f"[x] Échec du job pour pour l'uri {uri} : {result}")
                 else:
+                    continue
                     self.logger.info(f"[ok] Job soumis à bigquery pour {uri}")
