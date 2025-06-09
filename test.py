@@ -4,7 +4,7 @@ import re
 
 import pandas as pd
 
-from maintenance_predictive.Samsara_api_scraping.modules.transformation_configs import transformation_configs
+from modules.transformation_configs import transformation_configs
 from modules.gcp import BucketManager
 from modules.interface import SearchRetrieveType
 from modules.processing import TransformData
@@ -22,7 +22,9 @@ database_id = os.getenv('DWH_ID')
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials/maintenance-predictive-445011-fb98a59d6aa3.json"
 
 if __name__ == "__main__":
-    print(pd.to_datetime("2021-10-31T10:00:11.829Z", utc=True))
+    file = "test.log.2"
+    if file.endswith(".log") or file.startswith(".log.") or file.split(".log.")[-1].isdigit():
+        print(pd.to_datetime("2021-10-31T10:00:11.829Z", utc=True))
     exit()
     # configs = transformation_configs()
     # # save configs to json file

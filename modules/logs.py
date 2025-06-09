@@ -17,10 +17,10 @@ class MyLogger:
         self.logger.setLevel(logging.DEBUG)
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         # Gestionnaire pour l'affichage console
-        # if with_console:
-        #     console_handler = logging.StreamHandler()
-        #     console_handler.setFormatter(formatter)
-        #     self.logger.addHandler(console_handler)
+        if with_console:
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(console_handler)
         if not with_console:
             self.logger.propagate = False
         # Gestionnaire pour l'enregistrement des logs dans un fichier

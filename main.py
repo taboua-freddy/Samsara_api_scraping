@@ -8,7 +8,7 @@ import argparse
 
 from modules.interface import DownloadType
 from modules.interface import ColumnToUpdate
-from modules.metadata import get_metadata, build_metadata
+from modules.metadata import get_metadata, get_table_name_by_category, get_tables_default_table_names, build_metadata
 from modules.transformation_configs import MAPPING_TABLES
 from modules.utils import (
     CREDENTIALS_DIR,
@@ -29,7 +29,7 @@ from modules.metadata import make_meta_data, get_metadata_by_table_names
 
 load_dotenv()
 
-standard_logger = MyLogger("standard_logger")
+standard_logger = MyLogger("standard_logger", with_console=True)
 
 # Chargement des configurations à partir des variables d'environnement
 samsara_api_token = os.getenv("SAMSARA_API_TOKEN")
@@ -179,13 +179,13 @@ def load_to_bigquery(
     ).run(configs_for_update=configs_for_update, metadata=metadata)
 
 
-def upload_logs():
+def upload_logs(version: str = "v1"):
     gcs_client = GCSClient(bucket_name=gcs_raw_bucket_name)
     local_logs_path = LOGS_DIR
     for file in os.listdir(local_logs_path):
-        if file.endswith(".log"):
+        if file.endswith(".log") or file.startswith(".log.") or file.split(".log.")[-1].isdigit():
             buffer = file_buffer(open(os.path.join(local_logs_path, file), "rb").read())
-            destination = f"{gcs_client.bucket_manager.gcs_log_path}/{datetime.now().strftime('%Y_%m_%d')}/{file}"
+            destination = f"{gcs_client.bucket_manager.gcs_log_path}/{datetime.now().strftime('%Y_%m_%d')}/{version}/{file}"
             gcs_client.upload_bytes(buffer, destination)
 
 
@@ -211,13 +211,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_workers", type=int, help="Nombre de requêtes à traiter en parallèle"
     )
+    parser.add_argument(
+        "--table_cat", type=str, help="Quelle version de la table à utiliser pour le traitement"
+    )
     args = parser.parse_args()
     start_date = args.start_date
     end_date = args.end_date
     table_file_path = args.table_file_path
+    table_cat = args.table_cat
 
     # start_date = "01/02/2024"
-    end_date = "05/06/2025"
+    # end_date = "05/06/2025"
 
     if end_date is None:
         end_date = datetime.now().strftime("%d/%m/%Y")
@@ -231,54 +235,20 @@ if __name__ == "__main__":
         df = pd.read_excel(table_file_path)
         table_names = df.iloc[:, 0].tolist()
     else:
-        table_names = [
-            # EV ok
-            "fleet_vehicle_stats_evAverageBatteryTemperatureMilliCelsius",
-            "fleet_vehicle_stats_evBatteryStateOfHealthMilliPercent",
-            "fleet_vehicle_stats_evChargingCurrentMilliAmp",
-            "fleet_vehicle_stats_evChargingEnergyMicroWh",
-            "fleet_vehicle_stats_evChargingStatus",
-            "fleet_vehicle_stats_evChargingVoltageMilliVolt",
-            "fleet_vehicle_stats_evConsumedEnergyMicroWh",
-            "fleet_vehicle_stats_evDistanceDrivenMeters",
-            "fleet_vehicle_stats_evRegeneratedEnergyMicroWh",
-            "fleet_vehicle_stats_evStateOfChargeMilliPercent",
-            # time ok
-            "fleet_vehicle_stats_obdEngineSeconds",
-            "fleet_vehicle_stats_engineStates",
-            "fleet_vehicle_stats_gpsOdometerMeters",
-            "fleet_vehicle_stats_ecuSpeedMph",
-            "fleet_vehicles_fuel_energy",
-            "fleet_vehicle_stats_faultCodes",
-            "fleet_safety_events",
-            "fleet_assets_reefers",
-            "fleet_vehicle_idling",
-            # stats
-            "fleet_vehicle_stats_intakeManifoldTemperatureMilliC",
-            "fleet_vehicle_stats_engineRpm",
-            "fleet_vehicle_stats_engineOilPressureKPa",
-            "fleet_vehicle_stats_engineLoadPercent",
-            "fleet_vehicle_stats_engineImmobilizer",
-            "fleet_vehicle_stats_engineCoolantTemperatureMilliC",
-            "fleet_vehicle_stats_defLevelMilliPercent",
-            "fleet_vehicle_stats_batteryMilliVolts",
-            "fleet_vehicle_stats_barometricPressurePa",
-            "fleet_vehicle_stats_ambientAirTemperatureMilliC",  # ok
-            # core ok
-            "fleet_vehicles",  # ok
-            "fleet_assets",  # ok
-            "fleet_trailers",  # ok
-            "fleet_tags",  # ok
-            "fleet_devices",  # ok
-        ]
+        table_names = get_table_name_by_category().get(table_cat, get_tables_default_table_names())
+    standard_logger.info(f"Table names to process: {table_names}")
+    print(f"Table names to process: {table_names}")
 
+    log_version = "v1" if table_cat is None else table_cat
     gcs_client = GCSClient(bucket_name=gcs_raw_bucket_name)
+    standard_logger.info("Initialisation du client GCS et récupération des configurations pour la mise à jour.")
     configs_for_update = gcs_client.get_configs_for_update()
-    print(f"Table names to process avant: {configs_for_update}")
+    print(f"configs_for_update avant: {configs_for_update}")
     if configs_for_update is None:
         standard_logger.error("Le fichier de conf est endommagé.")
         exit()
-
+    standard_logger.info("Fichier de configuration récupéré avec succès.")
+    standard_logger.info("Construction des métadonnées à partir des configurations et des noms de tables.")
     metadata = build_metadata(
         configs_for_update=configs_for_update,
         table_names=table_names,
@@ -292,6 +262,7 @@ if __name__ == "__main__":
 
     max_workers = args.max_workers
 
+    standard_logger.info("Début de l'exécution du script pour le téléchargement des données Samsara et le chargement dans BigQuery.")
     start = datetime.now()
     scrape_samsara_to_gcs(metadata=metadata, iteration=0, max_workers=max_workers)
     end = datetime.now()
@@ -316,6 +287,7 @@ if __name__ == "__main__":
             f"Temps d'exécution pour l'exception '{filter_}': {td} secondes "
         )
 
+    standard_logger.info("Téléchargement des fichiers manquants.")
     download_missing_files(
         configs_for_update=configs_for_update,
         metadata=metadata,
@@ -342,12 +314,13 @@ if __name__ == "__main__":
     standard_logger.info("Fichier de configuration mis à jour avec les dates sans données.")
 
     # Transformation des données
+    standard_logger.info("Début de la transformation des données.")
     gcs_client.transform_and_save_data(
         target_bucket_name=gcs_flattened_bucket_name,
         metadata=metadata,
         configs_for_update=configs_for_update,
     )
-    # standard_logger.info("Transformation des données effectuée avec succès.")
+    standard_logger.info("Transformation des données effectuée avec succès.")
     gcs_client.update_configs_for_update(
         metadata=metadata,
         end_time=end_date,
@@ -356,6 +329,7 @@ if __name__ == "__main__":
     standard_logger.info("Fichier de configuration mis à jour avec les données transformées.")
 
     # Chargement des données dans BigQuery
+    standard_logger.info("Début du chargement des données dans BigQuery.")
     load_to_bigquery(
         metadata=metadata,
         configs_for_update=configs_for_update,
@@ -365,7 +339,7 @@ if __name__ == "__main__":
     standard_logger.info("Fichier de configuration mis à jour avec les données chargées dans BigQuery.")
 
     # Chargement des logs dans GCS
-    upload_logs()
+    upload_logs(log_version)
     standard_logger.info("Logs chargés dans GCS avec succès.")
 
     print("----------------------> Fin de l'execution <----------------------")

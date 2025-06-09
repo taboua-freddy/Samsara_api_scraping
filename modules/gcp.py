@@ -454,8 +454,9 @@ class BigQueryManager:
             metadata["table_name"] == MAPPING_TABLES.get(table_name, table_name)
             ]
         time_col = metadata.iloc[0].get("time_partitioning_field", None)
+        input_folder = metadata.iloc[0].get("family", "") + "/" + table_name
         bucket_manager: BucketManager = self.memory_manager.read("bucket_manager")
-        all_file_paths = bucket_manager.list_parquet_files()
+        all_file_paths = bucket_manager.list_parquet_files(input_folder=input_folder)
         downloaded_files = []
         for file_path in all_file_paths:
             file_name = file_path.split("/")[-1]
@@ -732,7 +733,7 @@ class GCSBigQueryLoader:
                     continue
                 input_folder = f"{family}/{table_name}"
                 files = self.bucket_manager.list_parquet_files(input_folder=input_folder)
-                files.reverse() # priviégier le schema des fichiers les plus récents
+                files.reverse()  # priviégier le schema des fichiers les plus récents
                 # Grouper les fichiers par table (en fonction du chemin)
                 for file_path in files:
                     table_name = self.bucket_manager.get_table_name(file_path)
@@ -755,7 +756,7 @@ class GCSBigQueryLoader:
                         executor.submit(
                             self.bigquery_manager.load_parquet_to_bigquery,
                             **{
-                                "uri":f"gs://{self.bucket_name}/{file_path}",
+                                "uri": f"gs://{self.bucket_name}/{file_path}",
                                 "table_name": table_name
                             },
                         )
