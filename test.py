@@ -10,7 +10,7 @@ from modules.interface import SearchRetrieveType
 from modules.processing import TransformData
 from modules.utils import CREDENTIALS_DIR, date_to_timestamp, extract_suffixe
 from modules.utils_transformation import json_normalize, set_column, to_datetime, split_dataframe, \
-    fast_json_normalize_parallel
+    fast_json_normalize_parallel, cast_column
 
 pd.set_option('display.max_columns', None)
 
@@ -22,9 +22,19 @@ database_id = os.getenv('DWH_ID')
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials/maintenance-predictive-445011-fb98a59d6aa3.json"
 
 if __name__ == "__main__":
-    file = "test.log.2"
-    if file.endswith(".log") or file.startswith(".log.") or file.split(".log.")[-1].isdigit():
-        print(pd.to_datetime("2021-10-31T10:00:11.829Z", utc=True))
+    file_name = "resources/data/fleet_vehicles_fuel_energy_2025_05_26.json"
+    # file_name = "resources/data/Copie de fleet_vehicles_fuel_energy_2025_05_26.parquet"
+    # data = pd.read_parquet(file_name)
+    with open(file_name, 'r') as file:
+        data = json.load(file)
+    data = pd.DataFrame(data)
+    data = data.query("vehicle_id=='212014918914612'")
+    # data = cast_column(data,["date"], dtype="datetime", utc=False)
+    # print(pd.to_datetime(data.date, unit='ms'))
+    print(data)
+    # file = "test.log.2"
+    # if file.endswith(".log") or file.startswith(".log.") or file.split(".log.")[-1].isdigit():
+    #     print(pd.to_datetime("2021-10-31T10:00:11.829Z", utc=True))
     exit()
     # configs = transformation_configs()
     # # save configs to json file

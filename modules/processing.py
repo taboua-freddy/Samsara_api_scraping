@@ -330,7 +330,7 @@ class DataFetcher:
         :param end_time: date de fin
         :return: None
         """
-        params = kwargs.get("params")
+        params = kwargs.get("params", {}).copy()
         if not params:
             raise ValueError("Les paramètres de la requête sont requis")
         start_end_config = get_start_end_date_config(params)

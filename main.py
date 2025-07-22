@@ -220,8 +220,8 @@ if __name__ == "__main__":
     table_file_path = args.table_file_path
     table_cat = args.table_cat
 
-    # start_date = "01/02/2024"
-    # end_date = "05/06/2025"
+    # start_date = "26/05/2025"
+    # end_date = "30/05/2025"
 
     if end_date is None:
         end_date = datetime.now().strftime("%d/%m/%Y")
