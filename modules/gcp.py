@@ -714,7 +714,7 @@ class GCSBigQueryLoader:
         self.logger: MyLogger = MyLogger("GCSBigQueryLoader", with_console=False)
         self._from: datetime | None = kwargs.get("_from", None)
         self._to: datetime | None = kwargs.get("_to", None)
-        self.max_workers = 32
+        self.max_workers = 1
         self.memory_manager: MemoryAccess | None = kwargs.get("memory_manager")
 
     def run(

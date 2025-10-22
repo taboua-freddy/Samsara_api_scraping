@@ -56,6 +56,7 @@ def transformation_configs(**kwargs) -> dict[str, dict[int, dict]]:
         "fleet_vehicle_stats_obdEngineSeconds": get_standard_transformation_config("obdEngineSeconds"),
         "fleet_vehicle_stats_engineStates": get_standard_transformation_config("engineStates"),
         "fleet_vehicle_stats_gpsOdometerMeters": get_standard_transformation_config("gpsOdometerMeters"),
+        "fleet_vehicle_stats_obdOdometerMeters": get_standard_transformation_config("obdOdometerMeters"),
         "fleet_vehicle_stats_ecuSpeedMph": get_standard_transformation_config("ecuSpeedMph"),
         "fleet_vehicles_fuel_energy": index_transformations(
             get_trans_to_set_df_column("date", value=kwargs.get("fuel_energy_date", None)),
