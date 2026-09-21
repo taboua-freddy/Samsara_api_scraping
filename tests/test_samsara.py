@@ -47,4 +47,22 @@ class SamsaraClientTests(unittest.TestCase):
         with self.assertRaises(requests.HTTPError):
             client.get_all_data("endpoint")
 
+    def test_dynamic_urls_share_the_endpoint_template_rate_limit(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {"data": [], "pagination": {}}
+        session = Mock()
+        session.get.return_value = response
+        rate_limiter = Mock()
+        client = SamsaraClient("token", rate_limiter, session=session)
+
+        client.get_all_data(
+            "v1/fleet/vehicles/123/safety/score",
+            max_calls_per_second=3,
+            rate_limit_key="v1/fleet/vehicles/{vehicleId}/safety/score",
+        )
+
+        rate_limiter.acquire.assert_called_once_with(
+            "v1/fleet/vehicles/{vehicleId}/safety/score", 3
+        )
+
         self.assertEqual(session.get.call_count, 1)

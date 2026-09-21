@@ -30,11 +30,17 @@ class SamsaraClient:
         self.delta_days = delta_days
         self.timeout = timeout
         self.session = session or requests.Session()
-        self.logger = MyLogger("SamsaraClient")
+        # Cloud Run only captures stdout/stderr while the job is running.  Keep
+        # file logs as before, and mirror API progress to the console as well.
+        self.logger = MyLogger("SamsaraClient", with_console=True)
         self.shared_vars_manager = shared_vars_manager
 
     def get_all_data(
-        self, endpoint: str, params: dict = None, max_calls_per_second=5
+        self,
+        endpoint: str,
+        params: dict = None,
+        max_calls_per_second=5,
+        rate_limit_key: str | None = None,
     ) -> list[dict]:
         """Return all pages for compatibility with dynamic endpoint workflows."""
         all_data = []
@@ -42,12 +48,17 @@ class SamsaraClient:
             endpoint,
             params=params,
             max_calls_per_second=max_calls_per_second,
+            rate_limit_key=rate_limit_key,
         ):
             all_data.extend(page)
         return all_data
 
     def iter_data_pages(
-        self, endpoint: str, params: dict = None, max_calls_per_second=5
+        self,
+        endpoint: str,
+        params: dict = None,
+        max_calls_per_second=5,
+        rate_limit_key: str | None = None,
     ):
         """Yield normalized pages and pagination metadata without accumulating them."""
         url = f"{self.base_url}/{endpoint}"
@@ -61,7 +72,11 @@ class SamsaraClient:
             last_error = None
 
             while not success and retry_count < max_retries:
-                self.rate_limiter.acquire(endpoint, max_calls_per_second)
+                # Dynamic URLs must share the quota of their endpoint template;
+                # otherwise every vehicle ID gets an independent limiter.
+                self.rate_limiter.acquire(
+                    rate_limit_key or endpoint, max_calls_per_second
+                )
                 try:
                     self.logger.info(
                         f"Demande de données à {url} avec les paramètres {params}"
@@ -111,7 +126,8 @@ class SamsaraClient:
                     f"Échec après plusieurs tentatives, arrêt du traitement pour {url} et les paramètres {params}"
                 )
                 raise RuntimeError(
-                    f"Échec de l'appel Samsara après {max_retries} tentatives: {url}"
+                    f"Échec de l'appel Samsara après {max_retries} tentatives: "
+                    f"{url}. Dernière erreur: {last_error}"
                 ) from last_error
             page = self._normalize_page(data)
             pagination = data.get("pagination", {})

@@ -445,6 +445,7 @@ class DataFetcher:
                         max_calls_per_second=self.endpoint_info.get(
                             "rate_limit_per_seconde", DEFAULT_RATE_LIMIT_SECOND
                         ),
+                        rate_limit_key=self.endpoint_info.get("endpoint"),
                     )
                     self._flatten_and_upload(data, file_name, date_str)
             else:
@@ -487,6 +488,7 @@ class DataFetcher:
             max_calls_per_second=self.endpoint_info.get(
                 "rate_limit_per_seconde", DEFAULT_RATE_LIMIT_SECOND
             ),
+            rate_limit_key=self.endpoint_info.get("endpoint"),
         )
         self._flatten_and_upload(data, file_name, date_str)
 

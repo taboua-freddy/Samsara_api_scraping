@@ -4,7 +4,7 @@ import os
 import re
 import tempfile
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from typing import Any, Literal
 
@@ -80,6 +80,18 @@ def parallelize_execution(tasks: list, func: Any, logger: logging, **kwargs):
     max_workers = kwargs.get("max_workers", None)
     if max_workers:
         kwargs.pop("max_workers")
+    progress_interval = float(
+        os.getenv("PARALLEL_PROGRESS_INTERVAL_SECONDS", "60")
+    )
+    if progress_interval <= 0:
+        progress_interval = 60
+    function_name = func if isinstance(func, str) else getattr(func, "__name__", "tâches")
+
+    def log_info(message: str) -> None:
+        info = getattr(logger, "info", None)
+        if callable(info):
+            info(message)
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
         if isinstance(func, str):
@@ -95,14 +107,45 @@ def parallelize_execution(tasks: list, func: Any, logger: logging, **kwargs):
                 else:
                     futures.append(executor.submit(func, **kwargs))
 
+        total = len(futures)
+        log_info(
+            f"Démarrage de {total} tâche(s) pour '{function_name}' "
+            f"avec max_workers={max_workers or 'auto'}"
+        )
         errors = []
         results = []
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as exc:
-                logger.error(f"Une tâche a généré une exception : {exc}")
-                errors.append(exc)
+        pending = set(futures)
+        completed = 0
+        progress_step = max(1, total // 100)
+        last_reported = 0
+
+        while pending:
+            done, pending = wait(
+                pending,
+                timeout=progress_interval,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                log_info(
+                    f"'{function_name}' toujours en cours: "
+                    f"{completed}/{total} terminée(s), {len(pending)} en attente"
+                )
+                continue
+
+            for future in done:
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    logger.error(f"Une tâche a généré une exception : {exc}")
+                    errors.append(exc)
+                completed += 1
+
+            if completed == total or completed - last_reported >= progress_step:
+                log_info(
+                    f"Progression '{function_name}': {completed}/{total} "
+                    f"tâche(s) terminée(s), {len(errors)} erreur(s)"
+                )
+                last_reported = completed
 
         if errors:
             raise RuntimeError(

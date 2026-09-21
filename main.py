@@ -33,7 +33,7 @@ from modules.utils import (
 
 load_dotenv()
 
-standard_logger = MyLogger("standard_logger", with_console=True)
+standard_logger = MyLogger("standard_logger")
 
 # Chargement des configurations à partir des variables d'environnement
 samsara_api_token = os.getenv("SAMSARA_API_TOKEN")
