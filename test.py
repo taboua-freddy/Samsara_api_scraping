@@ -1,5 +1,4 @@
 import json
-import os
 import re
 
 import pandas as pd
@@ -13,13 +12,6 @@ from modules.utils_transformation import json_normalize, set_column, to_datetime
     fast_json_normalize_parallel, cast_column
 
 pd.set_option('display.max_columns', None)
-
-samsara_api_token = os.getenv('SAMSARA_API_TOKEN')
-# gcs_bucket_name = os.getenv('GCS_BUCKET_NAME')
-# database_id = os.getenv('DATABASE_ID')
-gcs_bucket_name = os.getenv('GCS_BUCKET_FLATTENED_NAME')
-database_id = os.getenv('DWH_ID')
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials/maintenance-predictive-445011-fb98a59d6aa3.json"
 
 if __name__ == "__main__":
     file_name = "resources/data/fleet_vehicles_fuel_energy_2025_05_26.json"

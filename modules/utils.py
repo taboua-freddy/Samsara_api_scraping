@@ -2,11 +2,11 @@ import io
 import logging
 import os
 import re
+import tempfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Literal, Any
-import tempfile
+from typing import Any, Literal
 
 import pandas as pd
 import pyarrow as pa
@@ -95,11 +95,20 @@ def parallelize_execution(tasks: list, func: Any, logger: logging, **kwargs):
                 else:
                     futures.append(executor.submit(func, **kwargs))
 
+        errors = []
+        results = []
         for future in as_completed(futures):
             try:
-                future.result()
+                results.append(future.result())
             except Exception as exc:
                 logger.error(f"Une tâche a généré une exception : {exc}")
+                errors.append(exc)
+
+        if errors:
+            raise RuntimeError(
+                f"{len(errors)} tâche(s) sur {len(futures)} ont échoué"
+            ) from errors[0]
+        return results
 
 
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:

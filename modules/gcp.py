@@ -1,32 +1,115 @@
+import hashlib
 import json
 import os
 import re
+import socket
+import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta
-from io import BytesIO
-from typing import Literal
-import os
-import pyarrow.parquet as pq
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
+from typing import Callable
 
 import pandas as pd
-from google.cloud import storage, bigquery
+import pyarrow.parquet as pq
+from google.api_core.exceptions import Conflict, PreconditionFailed
+from google.cloud import bigquery, storage
 from google.cloud.exceptions import NotFound
 
-from .interface import SearchRetrieveType, ColumnToUpdate, DownloadType
+from .interface import ColumnToUpdate, DownloadType, SearchRetrieveType
 from .logs import MyLogger
 from .raters import MemoryAccess
 from .transformation import TransformData
 from .transformation_configs import MAPPING_TABLES
 from .utils import (
-    make_path,
-    parallelize_execution,
+    DEFAULT_START_DATE,
+    TMP_DIR,
+    CustomNamedTemporaryFile,
     extract_date_range,
-    pandas_to_bq_schema, DEFAULT_START_DATE, parquet_buffer, extract_suffixe, TMP_DIR, CustomNamedTemporaryFile,
+    extract_suffixe,
+    make_path,
+    pandas_to_bq_schema,
+    parallelize_execution,
+    parquet_buffer,
 )
 
 
+def build_load_fingerprint(
+    bucket_name: str,
+    file_path: str,
+    generation: str | int | None,
+    download_type: str,
+) -> str:
+    """Build a stable load identity; time files are treated as immutable."""
+    identity = f"gs://{bucket_name}/{file_path}"
+    if download_type == DownloadType.ONESHOT.value:
+        identity = f"{identity}#{generation or 'unknown'}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+class ExecutionLock:
+    """Atomic, expiring GCS lock used to prevent concurrent pipeline runs."""
+
+    def __init__(self, bucket, name: str, ttl_minutes: int):
+        self.blob = bucket.blob(name)
+        self.ttl = timedelta(minutes=ttl_minutes)
+        self.owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
+        self.generation = None
+
+    def acquire(self) -> "ExecutionLock":
+        now = datetime.now(timezone.utc)
+        payload = {
+            "owner": self.owner,
+            "acquired_at": now.isoformat(),
+            "expires_at": (now + self.ttl).isoformat(),
+        }
+        try:
+            self.blob.upload_from_string(
+                json.dumps(payload),
+                content_type="application/json",
+                if_generation_match=0,
+            )
+        except PreconditionFailed:
+            self.blob.reload()
+            existing = json.loads(self.blob.download_as_text())
+            expires_at = datetime.fromisoformat(existing["expires_at"])
+            if expires_at > now:
+                raise RuntimeError(
+                    "Une autre exécution du pipeline est active "
+                    f"(verrou détenu par {existing.get('owner', 'inconnu')})"
+                ) from None
+            stale_generation = self.blob.generation
+            self.blob.delete(if_generation_match=stale_generation)
+            self.blob.upload_from_string(
+                json.dumps(payload),
+                content_type="application/json",
+                if_generation_match=0,
+            )
+        self.blob.reload()
+        self.generation = self.blob.generation
+        return self
+
+    def release(self) -> None:
+        if self.generation is None:
+            return
+        try:
+            self.blob.delete(if_generation_match=self.generation)
+        except (NotFound, PreconditionFailed):
+            pass
+        finally:
+            self.generation = None
+
+
 class BucketManager:
+    FILE_PATH_REGEX = re.compile(
+        r"^(?P<family>[^/]+)/"
+        r"(?P<main_family>[^/]+)/"
+        r"(?P<table_name>.+?)"
+        r"(?:_(?P<start_date>\d{4}_\d{2}_\d{2}))?"
+        r"(?:_to_(?P<end_date>\d{4}_\d{2}_\d{2}))?"
+        r"(?:_(?P<index>\d+))?"
+        r"\.parquet$"
+    )
 
     def __init__(self, bucket_name: str):
         self.bucket_name = bucket_name
@@ -38,20 +121,21 @@ class BucketManager:
         )
         parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.tmp_folder = make_path(os.path.join(parent_dir, "resources", "tmp"))
-        # self.folder_pattern = r"/([^/]+)/\1_(\d{4}_\d{2}_\d{2})(?:_to_(\d{4}_\d{2}_\d{2}))?(?:_(\d+))?\.parquet"
-        self.file_path_regex = re.compile(
-            r"^(?P<family>[^/]+)/"
-            r"(?P<main_family>[^/]+)/"
-            r"(?P<table_name>.+?)"
-            r"(?:_(?P<start_date>\d{4}_\d{2}_\d{2}))?"
-            r"(?:_to_(?P<end_date>\d{4}_\d{2}_\d{2}))?"
-            r"(?:_(?P<index>\d+))?"
-            r"\.parquet$"
-        )
+        self.file_path_regex = self.FILE_PATH_REGEX
         self.gcs_log_path = "resources/logs"  # os.path.join("resources", "logs")
         self.gcs_config_path = (
             "resources/configs"  # os.path.join("resources", "configs")
         )
+
+    def acquire_execution_lock(self, ttl_minutes: int = 1440) -> ExecutionLock:
+        if ttl_minutes < 1:
+            raise ValueError("ttl_minutes doit être supérieur ou égal à 1")
+        lock = ExecutionLock(
+            self.bucket,
+            f"{self.gcs_config_path}/pipeline_execution.lock",
+            ttl_minutes,
+        )
+        return lock.acquire()
 
     def delete_file(self, blob_name: str) -> None:
         """
@@ -125,16 +209,46 @@ class BucketManager:
 
     def list_parquet_files(self, input_folder: str = None) -> list[str]:
         """Lister les fichiers Parquet dans le bucket GCS."""
+        return [
+            item["name"]
+            for item in self.list_parquet_file_metadata(input_folder=input_folder)
+        ]
+
+    def list_parquet_file_metadata(self, input_folder: str = None) -> list[dict]:
+        """List Parquet paths with their GCS generation."""
         self.logger.info(f"Listing Parquet files in bucket: {self.bucket_name}")
         if input_folder:
             input_folder = input_folder if input_folder.endswith("/") else input_folder + "/"
         files = [
-            blob.name
+            {"name": blob.name, "generation": str(blob.generation or "")}
             for blob in self.bucket.list_blobs(prefix=input_folder)
             if blob.name.endswith(".parquet")
         ]
         self.logger.debug(f"Found files: {len(files)} Parquet files")
         return files
+
+    def cleanup_logs(self, retention_days: int, dry_run: bool = False) -> dict:
+        """Delete GCS log objects older than the configured retention period."""
+        if retention_days < 1:
+            raise ValueError("retention_days doit être supérieur ou égal à 1")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        candidates = []
+        for blob in self.bucket.list_blobs(prefix=f"{self.gcs_log_path}/"):
+            updated = blob.updated
+            if updated is not None and updated <= cutoff:
+                candidates.append(blob)
+        if not dry_run:
+            for blob in candidates:
+                blob.delete()
+        report = {
+            "retention_days": retention_days,
+            "dry_run": dry_run,
+            "scanned_prefix": f"{self.gcs_log_path}/",
+            "deleted": len(candidates) if not dry_run else 0,
+            "would_delete": len(candidates) if dry_run else 0,
+        }
+        self.logger.info(f"Nettoyage des logs GCS terminé: {report}")
+        return report
 
     def parse_file_path(
             self, file_path: str, retrieve_type: SearchRetrieveType
@@ -287,7 +401,7 @@ class BucketManager:
 
         # Regroupement des sous-tables sous le label de la table principale
         # par exemple fleet_tag_vehicles, fleet_tag_drivers sous fleet_tags qui est connu dans les metadata
-        for main_table_name, sub_tables in tables_to_map.items():
+        for _main_table_name, sub_tables in tables_to_map.items():
             _missing_dates = []
             for sub_table in sub_tables:
                 if sub_table in missing_dates:
@@ -306,13 +420,11 @@ class BucketManager:
         :return: None
         """
         try:
+            self.storage_client.get_bucket(self.bucket_name)
+            self.logger.info(f"Bucket {self.bucket_name} already exists.")
+        except NotFound:
             self.storage_client.create_bucket(self.bucket_name, location="EU")
             self.logger.info(f"Bucket {self.bucket_name} created successfully.")
-        except Exception as e:
-            if "already exists" in str(e):
-                self.logger.info(f"Bucket {self.bucket_name} already exists.")
-            else:
-                self.logger.error(f"Error creating bucket {self.bucket_name}: {e}")
 
 
 class BigQueryManager:
@@ -328,7 +440,9 @@ class BigQueryManager:
         )  # Durée de conservation des partitions
         self.partition_expiration_ms = int(timedelta(days=self.partition_expiration_days).total_seconds() * 1000)
 
-    def load_parquet_to_bigquery(self, uri: str, table_name: str) -> tuple[str, bigquery.LoadJob] | tuple[str, Exception]:
+    def load_parquet_to_bigquery(
+            self, uri: str, table_name: str, job_id: str | None = None
+    ) -> tuple[str, bigquery.LoadJob] | tuple[str, Exception]:
         """Charger un fichier Parquet de GCS vers BigQuery."""
         table_id = f"{self.bigquery_client.project}.{self.dataset_id}.{table_name}"
 
@@ -426,20 +540,26 @@ class BigQueryManager:
             f"Loading files into BigQuery table '{table_name}' from URIs: {uri}"
         )
         try:
-            load_job = self.bigquery_client.load_table_from_uri(
-                uri, table_id, job_config=job_config
+            try:
+                load_job = self.bigquery_client.load_table_from_uri(
+                    uri, table_id, job_config=job_config, job_id=job_id
+                )
+            except Conflict:
+                if not job_id:
+                    raise
+                self.logger.info(
+                    f"Le job BigQuery {job_id} existe déjà, récupération du résultat."
+                )
+                load_job = self.bigquery_client.get_job(job_id)
+            result = load_job.result()
+            if load_job.errors:
+                raise RuntimeError(
+                    f"Erreurs BigQuery pour la table '{table_name}': {load_job.errors}"
+                )
+            self.logger.info(
+                f"Table '{table_name}' mise à jour avec succès depuis {uri}."
             )
-            return (uri, load_job)
-            # Attendre la fin du job
-            # result = load_job.result()
-            # if result.errors:
-            #     self.logger.error(
-            #         f"Errors occurred while loading files into BigQuery table '{table_name}': {load_job.errors}"
-            #     )
-            # if result.done() > 0:
-            #     self.logger.info(
-            #         f"Table '{table_name}' successfully updated in BigQuery with files from {uri}."
-            #     )
+            return (uri, result)
         except Exception as e:
             return (uri, e)
 
@@ -523,6 +643,7 @@ class GCSClient:
             self.bucket_manager.logger.error(
                 f"erreur lors de la migration des données vers GCS: {e}"
             )
+            raise
 
     def _upload_dict(self, data: dict, destination_blob_name: str) -> None:
         """
@@ -543,7 +664,7 @@ class GCSClient:
         blob_exists, blob = self.bucket_manager.file_exists(blob_name)
         if not blob_exists:
             self.bucket_manager.logger.warning(
-                f"Le fichier de configuration est introuvable dans le bucket."
+                "Le fichier de configuration est introuvable dans le bucket."
             )
             # raise FileNotFoundError(f"Le fichier de configuration est introuvable dans le bucket.")
             return {}
@@ -571,13 +692,174 @@ class GCSClient:
         :param erase: Effacer les configurations existantes
         :return: None
         """
+        def update(current: dict) -> dict:
+            return data if erase else self._merge_config(current, data)
+
+        self._mutate_config(filename, update)
+
+    def _mutate_config(
+        self, filename: str, mutator: Callable[[dict], dict]
+    ) -> dict:
+        """Atomically mutate a JSON config, retrying on generation conflicts."""
         blob_name = f"{self.bucket_manager.gcs_config_path}/{filename}.json"
-        if not erase:
-            config = self.get_configs_for_update()
-            config.update(data)
-            data = config
-        # self.bucket_manager.delete_file(blob_name)
-        self._upload_dict(data, blob_name)
+        blob = self.bucket_manager.bucket.blob(blob_name)
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            generation = 0
+            current = {}
+            if blob.exists():
+                blob.reload()
+                generation = blob.generation
+                current = json.loads(
+                    blob.download_as_bytes(if_generation_match=generation)
+                )
+
+            updated = mutator(current)
+            buffer = BytesIO(json.dumps(updated, indent=4).encode("utf-8"))
+            try:
+                blob.upload_from_file(
+                    buffer,
+                    content_type="application/json",
+                    if_generation_match=generation,
+                )
+                return updated
+            except PreconditionFailed as exc:
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        f"Conflit persistant lors de la mise à jour de {blob_name}"
+                    ) from exc
+                self.bucket_manager.logger.warning(
+                    f"Conflit de génération pour {blob_name}, nouvelle tentative"
+                )
+        raise RuntimeError(f"Impossible de mettre à jour {blob_name}")
+
+    @staticmethod
+    def _merge_config(current: dict, updates: dict) -> dict:
+        merged = current.copy()
+        for key, value in updates.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = GCSClient._merge_config(merged[key], value)
+            elif isinstance(value, list) and isinstance(merged.get(key), list):
+                merged[key] = list(dict.fromkeys([*merged[key], *value]))
+            else:
+                merged[key] = value
+        return merged
+
+    def get_bigquery_load_manifest(self) -> dict:
+        return self._get_config("bigquery_load_manifest")
+
+    def update_bigquery_load_manifest(self, entries: dict) -> None:
+        if entries:
+            self._update_config(entries, "bigquery_load_manifest")
+
+    def get_extraction_manifest(self) -> dict:
+        return self._get_config("extraction_manifest")
+
+    def update_extraction_state(self, state_key: str, state: dict) -> None:
+        def replace_state(current: dict) -> dict:
+            updated = current.copy()
+            updated[state_key] = state
+            return updated
+
+        self._mutate_config("extraction_manifest", replace_state)
+
+    def cleanup_bigquery_load_manifest(
+        self,
+        configs_for_update: dict,
+        retention_days: int = 30,
+        dry_run: bool = True,
+        now: datetime | None = None,
+    ) -> dict:
+        """Remove safe-to-forget manifest entries and return a cleanup report."""
+        if retention_days < 0:
+            raise ValueError("retention_days doit être positif ou nul")
+        cutoff = (now or datetime.now()) - timedelta(days=retention_days)
+        existence_cache = {}
+        report = {}
+
+        def clean(manifest: dict) -> dict:
+            nonlocal report
+            reasons = {"orphan": [], "checkpointed": [], "obsolete_oneshot": []}
+            keep = {}
+            oneshot_by_uri = defaultdict(list)
+
+            for fingerprint, entry in manifest.items():
+                if not isinstance(entry, dict):
+                    keep[fingerprint] = entry
+                    continue
+                uri = entry.get("uri", "")
+                prefix = f"gs://{self.bucket_manager.bucket_name}/"
+                if not uri.startswith(prefix):
+                    keep[fingerprint] = entry
+                    continue
+                blob_name = uri[len(prefix):]
+                if blob_name not in existence_cache:
+                    existence_cache[blob_name] = self.bucket_manager.file_exists(blob_name)[0]
+                if not existence_cache[blob_name]:
+                    reasons["orphan"].append(fingerprint)
+                    continue
+
+                source_table = entry.get("source_table_name") or entry.get("table_name")
+                config = configs_for_update.get(source_table, {})
+                download_type = config.get("download_type", DownloadType.TIME.value)
+                if download_type == DownloadType.ONESHOT.value:
+                    oneshot_by_uri[uri].append((fingerprint, entry))
+                    continue
+
+                loaded_at = self._parse_manifest_datetime(entry.get("loaded_at"))
+                checkpoint = config.get(ColumnToUpdate.DATABASE.value)
+                file_start = self.bucket_manager.get_start_date(blob_name)
+                checkpoint_date = (
+                    datetime.strptime(checkpoint, "%d/%m/%Y") if checkpoint else None
+                )
+                if (
+                    loaded_at
+                    and loaded_at < cutoff
+                    and file_start
+                    and checkpoint_date
+                    and file_start < checkpoint_date
+                ):
+                    reasons["checkpointed"].append(fingerprint)
+                    continue
+                keep[fingerprint] = entry
+
+            for uri_entries in oneshot_by_uri.values():
+                ordered = sorted(
+                    uri_entries,
+                    key=lambda item: self._parse_manifest_datetime(
+                        item[1].get("loaded_at")
+                    ) or datetime.min,
+                    reverse=True,
+                )
+                latest_fingerprint, latest_entry = ordered[0]
+                keep[latest_fingerprint] = latest_entry
+                reasons["obsolete_oneshot"].extend(
+                    fingerprint for fingerprint, _entry in ordered[1:]
+                )
+
+            report = {
+                "dry_run": dry_run,
+                "total": len(manifest),
+                "kept": len(keep),
+                "removed": sum(len(values) for values in reasons.values()),
+                "reasons": {key: len(value) for key, value in reasons.items()},
+            }
+            return keep
+
+        if dry_run:
+            clean(self.get_bigquery_load_manifest())
+        else:
+            self._mutate_config("bigquery_load_manifest", clean)
+        return report
+
+    @staticmethod
+    def _parse_manifest_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value).replace(tzinfo=None)
+        except (TypeError, ValueError):
+            return None
 
     def update_configs_for_update(self, metadata: pd.DataFrame, end_time: str, col_to_update: ColumnToUpdate,
                                   **kwargs) -> None:
@@ -593,21 +875,18 @@ class GCSClient:
             None: Cette méthode ne retourne rien, elle met à jour les configurations directement dans le bucket GCS.
         """
         # Récupère les configurations existantes depuis le bucket GCS.
-        data = self.get_configs_for_update()
+        data = {}
         all_missing_dates: dict[str, list[datetime]] = kwargs.get("missing_dates", {})
         # Parcourt chaque ligne des métadonnées pour mettre à jour les configurations.
         for _, row in metadata.iterrows():
             # Récupère le nom de la table depuis les métadonnées.
             if table_name := row.get("table_name"):
                 missing_dates = [date.strftime("%d/%m/%Y") for date in all_missing_dates.get(table_name, [])]
-
-                # Si la table n'existe pas dans les configurations, l'ajoute.
-                if table_name not in data:
-                    data[table_name] = {}
+                data[table_name] = {}
                 # Met à jour les configurations pour la table avec la date de fin et le type de téléchargement.
                 data[table_name].update(
                     {
-                        col_to_update.value: end_time if col_to_update != ColumnToUpdate.DATE_NO_DATA else list(set(data.get(table_name, {}).get(col_to_update.value, []) + missing_dates)),
+                        col_to_update.value: end_time if col_to_update != ColumnToUpdate.DATE_NO_DATA else missing_dates,
                         "download_type": row.get("download_type", "time"),
                         # Définit le type de téléchargement (par défaut: "time").
                     }
@@ -631,7 +910,7 @@ class GCSClient:
         # Crée un client GCS pour le bucket cible
         self.target_bucket_manager = BucketManager(target_bucket_name)
         tasks = []
-        for index, row in metadata.iterrows():
+        for _index, row in metadata.iterrows():
             table_name = row.get("table_name")
             family = row.get("family")
             if not table_name or not family:
@@ -709,6 +988,7 @@ class GCSBigQueryLoader:
         self.bucket_name: str = bucket_name
         self.dataset_id: str = dataset_id
         self.bucket_manager: BucketManager = BucketManager(bucket_name)
+        self.gcs_client = GCSClient(bucket_name)
         self.bigquery_manager: BigQueryManager = BigQueryManager(dataset_id, **kwargs)
         # Configurer le logger
         self.logger: MyLogger = MyLogger("GCSBigQueryLoader", with_console=False)
@@ -722,20 +1002,24 @@ class GCSBigQueryLoader:
     ) -> None:
         """Exécuter le processus de chargement pour tous les fichiers Parquet."""
         futures = []
+        failures = []
+        successful_manifest_entries = {}
+        manifest = self.gcs_client.get_bigquery_load_manifest()
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            table_to_paths = defaultdict(list)
+            future_entries = {}
             for _, row in metadata.iterrows():
-                table_name = row.get("table_name")
-                if not table_name:
+                configured_table_name = row.get("table_name")
+                if not configured_table_name:
                     continue
                 family = row.get("family")
                 if not family:
                     continue
-                input_folder = f"{family}/{table_name}"
-                files = self.bucket_manager.list_parquet_files(input_folder=input_folder)
+                input_folder = f"{family}/{configured_table_name}"
+                files = self.bucket_manager.list_parquet_file_metadata(input_folder=input_folder)
                 files.reverse()  # priviégier le schema des fichiers les plus récents
                 # Grouper les fichiers par table (en fonction du chemin)
-                for file_path in files:
+                for file_metadata in files:
+                    file_path = file_metadata["name"]
                     table_name = self.bucket_manager.get_table_name(file_path)
                     start_date = self.bucket_manager.get_start_date(file_path)
                     if self._from:
@@ -752,22 +1036,50 @@ class GCSBigQueryLoader:
                             if start_date and start_date < datetime.strptime(last_update_date, "%d/%m/%Y"):
                                 continue
 
-                    futures.append(
-                        executor.submit(
+                    mapped_table_name = MAPPING_TABLES.get(table_name, table_name)
+                    download_type = row.get("download_type", DownloadType.TIME.value)
+                    fingerprint = build_load_fingerprint(
+                        self.bucket_name,
+                        file_path,
+                        file_metadata.get("generation"),
+                        download_type,
+                    )
+                    if fingerprint in manifest:
+                        self.logger.info(f"[skip] Fichier déjà chargé: {file_path}")
+                        continue
+
+                    future = executor.submit(
                             self.bigquery_manager.load_parquet_to_bigquery,
                             **{
                                 "uri": f"gs://{self.bucket_name}/{file_path}",
-                                "table_name": table_name
+                                "table_name": table_name,
+                                "job_id": f"samsara_load_{fingerprint}",
                             },
                         )
-                    )
-                    table_to_paths[table_name].append(file_path)
+                    futures.append(future)
+                    future_entries[future] = {
+                        "fingerprint": fingerprint,
+                        "entry": {
+                            "uri": f"gs://{self.bucket_name}/{file_path}",
+                            "table_name": table_name,
+                            "source_table_name": mapped_table_name,
+                            "generation": file_metadata.get("generation"),
+                            "loaded_at": datetime.now().isoformat(),
+                        },
+                    }
 
             # Attendre que toutes les tâches soient terminées
             for future in as_completed(futures):
                 uri, result = future.result()
                 if isinstance(result, Exception):
                     self.logger.error(f"[x] Échec du job pour pour l'uri {uri} : {result}")
+                    failures.append((uri, result))
                 else:
-                    continue
                     self.logger.info(f"[ok] Job soumis à bigquery pour {uri}")
+                    manifest_entry = future_entries[future]
+                    successful_manifest_entries[manifest_entry["fingerprint"]] = manifest_entry["entry"]
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} chargement(s) BigQuery ont échoué"
+            ) from failures[0][1]
+        self.gcs_client.update_bigquery_load_manifest(successful_manifest_entries)

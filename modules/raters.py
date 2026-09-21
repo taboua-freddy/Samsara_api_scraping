@@ -8,6 +8,8 @@ class RateLimiter:
         cette classe implémente un rate limiter pour limiter le nombre de requêtes par seconde
         :param max_calls_per_second: Nombre maximal de requêtes par seconde
         """
+        if max_calls_per_second <= 0:
+            raise ValueError("max_calls_per_second doit être supérieur à zéro")
         self.max_calls_per_second: int | float = (
             max_calls_per_second  # Limite de requêtes par seconde
         )
@@ -47,6 +49,7 @@ class EndpointRateLimiter:
 
     def __init__(self, max_calls_per_second: int | float = 150):
         self.endpoint_limiters: dict = {}
+        self.endpoint_limiters_lock = Lock()
         self.global_rate_limiter: RateLimiter = RateLimiter(
             max_calls_per_second
         )  # Limite globale de 150 req/s
@@ -58,9 +61,10 @@ class EndpointRateLimiter:
         :param max_calls_per_second: nombre maximal de requêtes par seconde
         :return: le rate limiter pour l'endpoint de la table spécifiée
         """
-        if endpoint not in self.endpoint_limiters:
-            self.endpoint_limiters[endpoint] = RateLimiter(max_calls_per_second)
-        return self.endpoint_limiters[endpoint]
+        with self.endpoint_limiters_lock:
+            if endpoint not in self.endpoint_limiters:
+                self.endpoint_limiters[endpoint] = RateLimiter(max_calls_per_second)
+            return self.endpoint_limiters[endpoint]
 
     def acquire(self, endpoint: str, max_calls_per_second) -> None:
         """

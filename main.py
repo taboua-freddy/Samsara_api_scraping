@@ -1,31 +1,35 @@
 
+import argparse
+import atexit
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 from dotenv import load_dotenv
-import argparse
 
-from modules.interface import DownloadType
-from modules.interface import ColumnToUpdate
-from modules.metadata import get_metadata, get_table_name_by_category, get_tables_default_table_names, build_metadata
+from modules.gcp import BucketManager, GCSBigQueryLoader, GCSClient
+from modules.interface import ColumnToUpdate, DownloadType
+from modules.logs import MyLogger
+from modules.metadata import (
+    build_metadata,
+    get_metadata,
+    get_table_name_by_category,
+    get_tables_default_table_names,
+    make_meta_data,
+)
+from modules.processing import DataFetcher
+from modules.raters import EndpointRateLimiter, MemoryAccess
+from modules.samsara import SamsaraClient
 from modules.transformation_configs import MAPPING_TABLES
 from modules.utils import (
     CREDENTIALS_DIR,
-    get_start_end_date_config,
-    process_params,
-    DATA_DIR,
+    DEFAULT_START_DATE,
     LOGS_DIR,
-    file_buffer, DEFAULT_START_DATE,
+    file_buffer,
+    get_start_end_date_config,
+    parallelize_execution,
+    process_params,
 )
-from modules.raters import MemoryAccess
-from modules.logs import MyLogger
-from modules.gcp import GCSBigQueryLoader, GCSClient, BucketManager
-from modules.processing import DataFetcher, TransformData
-from modules.raters import EndpointRateLimiter
-from modules.samsara import SamsaraClient
-from modules.utils import parallelize_execution
-from modules.metadata import make_meta_data, get_metadata_by_table_names
 
 load_dotenv()
 
@@ -36,9 +40,31 @@ samsara_api_token = os.getenv("SAMSARA_API_TOKEN")
 gcs_raw_bucket_name = os.getenv("GCS_RAW_BUCKET_NAME")
 gcs_flattened_bucket_name = os.getenv("GCS_FLATTENED_BUCKET_NAME")
 database_id = os.getenv("DATABASE_ID")
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
-    CREDENTIALS_DIR, os.getenv("GCP_CREDENTIALS_FILE_NAME")
-)
+gcp_credentials_file_name = os.getenv("GCP_CREDENTIALS_FILE_NAME")
+if gcp_credentials_file_name:
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
+        CREDENTIALS_DIR, gcp_credentials_file_name
+    )
+
+
+def validate_runtime_config() -> None:
+    required_values = {
+        "SAMSARA_API_TOKEN": samsara_api_token,
+        "GCS_RAW_BUCKET_NAME": gcs_raw_bucket_name,
+        "GCS_FLATTENED_BUCKET_NAME": gcs_flattened_bucket_name,
+        "DATABASE_ID": database_id,
+    }
+    missing = [name for name, value in required_values.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "Variables d'environnement manquantes: " + ", ".join(missing)
+        )
+
+    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if credentials_path and not os.path.isfile(credentials_path):
+        raise RuntimeError(
+            "Le fichier GOOGLE_APPLICATION_CREDENTIALS configuré est introuvable"
+        )
 
 
 def download_missing_files(
@@ -71,7 +97,7 @@ def download_missing_files(
             if metadata.empty or metadata.iloc[0].get("download_type") == DownloadType.ONESHOT.value:
                 continue
 
-            for index, row in metadata.iterrows():
+            for _index, row in metadata.iterrows():
                 endpoint_info = row.to_dict()
                 data_fetcher = DataFetcher(
                     samsara_client, gcs_client, endpoint_info, max_workers=max_workers
@@ -184,9 +210,132 @@ def upload_logs(version: str = "v1"):
     local_logs_path = LOGS_DIR
     for file in os.listdir(local_logs_path):
         if file.endswith(".log") or file.startswith(".log.") or file.split(".log.")[-1].isdigit():
-            buffer = file_buffer(open(os.path.join(local_logs_path, file), "rb").read())
+            with open(os.path.join(local_logs_path, file), "rb") as log_file:
+                buffer = file_buffer(log_file.read())
             destination = f"{gcs_client.bucket_manager.gcs_log_path}/{datetime.now().strftime('%Y_%m_%d')}/{version}/{file}"
             gcs_client.upload_bytes(buffer, destination)
+
+
+def cleanup_load_manifest(gcs_client: GCSClient) -> dict:
+    retention_days = int(os.getenv("BIGQUERY_MANIFEST_RETENTION_DAYS", "30"))
+    configs = gcs_client.get_configs_for_update()
+    flattened_client = GCSClient(bucket_name=gcs_flattened_bucket_name)
+    report = flattened_client.cleanup_bigquery_load_manifest(
+        configs_for_update=configs,
+        retention_days=retention_days,
+        dry_run=False,
+    )
+    standard_logger.info(f"Nettoyage du manifeste BigQuery terminé: {report}")
+    return report
+
+
+def cleanup_logs(gcs_client: GCSClient) -> dict:
+    retention_days = int(os.getenv("LOG_RETENTION_DAYS", "30"))
+    if retention_days < 1:
+        raise ValueError("LOG_RETENTION_DAYS doit être supérieur ou égal à 1")
+
+    cloud_report = gcs_client.bucket_manager.cleanup_logs(retention_days)
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    local_deleted = 0
+    for file_name in os.listdir(LOGS_DIR):
+        file_path = os.path.join(LOGS_DIR, file_name)
+        if not os.path.isfile(file_path) or ".log" not in file_name:
+            continue
+        modified_at = datetime.fromtimestamp(os.path.getmtime(file_path))
+        if modified_at <= cutoff:
+            os.remove(file_path)
+            local_deleted += 1
+
+    report = {
+        "retention_days": retention_days,
+        "local_deleted": local_deleted,
+        "cloud": cloud_report,
+    }
+    standard_logger.info(f"Nettoyage des logs terminé: {report}")
+    return report
+
+
+def print_stage_progress(current: int, total: int, label: str) -> None:
+    width = 24
+    completed = round(width * current / total)
+    bar = "#" * completed + "-" * (width - completed)
+    print(f"[{bar}] {current}/{total} {label}")
+
+
+def run_download_stage(
+    gcs_client: GCSClient,
+    metadata: pd.DataFrame,
+    configs_for_update: dict,
+    start_date: str,
+    end_date: str,
+    max_workers: int | None,
+) -> None:
+    started_at = datetime.now()
+    scrape_samsara_to_gcs(metadata=metadata, iteration=0, max_workers=max_workers)
+    scrape_samsara_to_gcs(
+        metadata=metadata,
+        iteration=0,
+        is_exception=True,
+        max_workers=max_workers,
+    )
+    download_missing_files(
+        configs_for_update=configs_for_update,
+        metadata=metadata,
+        start_date=start_date,
+        end_date=end_date,
+        max_workers=max_workers,
+    )
+    gcs_client.update_configs_for_update(
+        metadata=metadata,
+        end_time=end_date,
+        col_to_update=ColumnToUpdate.DOWNLOAD,
+    )
+    missing_dates = gcs_client.bucket_manager.missing_dates(
+        metadata=metadata,
+        configs_for_update=configs_for_update,
+        end_date=datetime.strptime(end_date, "%d/%m/%Y"),
+        start_date=datetime.strptime(start_date, "%d/%m/%Y"),
+    )
+    gcs_client.update_configs_for_update(
+        metadata=metadata,
+        end_time=end_date,
+        col_to_update=ColumnToUpdate.DATE_NO_DATA,
+        missing_dates=missing_dates,
+    )
+    elapsed = (datetime.now() - started_at).total_seconds()
+    standard_logger.info(f"Étape download terminée en {elapsed} secondes")
+
+
+def run_transform_stage(
+    gcs_client: GCSClient,
+    metadata: pd.DataFrame,
+    configs_for_update: dict,
+    end_date: str,
+) -> None:
+    gcs_client.transform_and_save_data(
+        target_bucket_name=gcs_flattened_bucket_name,
+        metadata=metadata,
+        configs_for_update=configs_for_update,
+    )
+    gcs_client.update_configs_for_update(
+        metadata=metadata,
+        end_time=end_date,
+        col_to_update=ColumnToUpdate.TRANSFORMATION,
+    )
+
+
+def run_load_stage(
+    gcs_client: GCSClient,
+    metadata: pd.DataFrame,
+    configs_for_update: dict,
+    end_date: str,
+) -> None:
+    load_to_bigquery(metadata=metadata, configs_for_update=configs_for_update)
+    gcs_client.update_configs_for_update(
+        metadata=metadata,
+        end_time=end_date,
+        col_to_update=ColumnToUpdate.DATABASE,
+    )
 
 
 if __name__ == "__main__":
@@ -214,11 +363,43 @@ if __name__ == "__main__":
     parser.add_argument(
         "--table_cat", type=str, help="Quelle version de la table à utiliser pour le traitement"
     )
+    parser.add_argument(
+        "--table",
+        dest="selected_tables",
+        action="append",
+        help="Table précise à traiter. L'option peut être répétée.",
+    )
+    parser.add_argument(
+        "--stages",
+        nargs="+",
+        choices=("download", "transform", "load"),
+        default=("download", "transform", "load"),
+        help="Étapes à exécuter, dans l'ordre du pipeline.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Valide et affiche le plan sans appeler Samsara, GCS ou BigQuery.",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        help="Fenêtre glissante se terminant aujourd'hui, adaptée aux exécutions planifiées.",
+    )
     args = parser.parse_args()
     start_date = args.start_date
     end_date = args.end_date
     table_file_path = args.table_file_path
     table_cat = args.table_cat
+
+    if args.lookback_days is not None:
+        if args.lookback_days < 1:
+            parser.error("lookback-days doit être supérieur ou égal à 1")
+        if args.start_date or args.end_date:
+            parser.error("lookback-days ne peut pas être combiné avec start_date/end_date")
+        today = datetime.now()
+        start_date = (today - timedelta(days=args.lookback_days)).strftime("%d/%m/%Y")
+        end_date = today.strftime("%d/%m/%Y")
 
     # start_date = "26/05/2025"
     # end_date = "30/05/2025"
@@ -229,7 +410,19 @@ if __name__ == "__main__":
     if start_date is None:
         start_date = DEFAULT_START_DATE
 
-    if table_file_path == "ALL":
+    try:
+        parsed_start_date = datetime.strptime(start_date, "%d/%m/%Y")
+        parsed_end_date = datetime.strptime(end_date, "%d/%m/%Y")
+    except ValueError:
+        parser.error("Les dates doivent respecter le format jj/mm/aaaa")
+    if parsed_start_date > parsed_end_date:
+        parser.error("start_date doit être antérieure ou égale à end_date")
+    if args.max_workers is not None and args.max_workers < 1:
+        parser.error("max_workers doit être supérieur ou égal à 1")
+
+    if args.selected_tables:
+        table_names = list(dict.fromkeys(args.selected_tables))
+    elif table_file_path == "ALL":
         table_names = make_meta_data(start_date, end_date)["table_name"].tolist()
     elif table_file_path is not None and os.path.isfile(table_file_path):
         df = pd.read_excel(table_file_path)
@@ -239,14 +432,31 @@ if __name__ == "__main__":
     standard_logger.info(f"Table names to process: {table_names}")
     print(f"Table names to process: {table_names}")
 
+    if args.dry_run:
+        plan = get_metadata(
+            make_meta_data(start_date, end_date), table_names=table_names
+        )
+        if plan.empty:
+            parser.error("Aucune table valide dans le plan demandé")
+        missing_tables = sorted(set(table_names) - set(plan["table_name"]))
+        if missing_tables:
+            parser.error("Tables inconnues: " + ", ".join(missing_tables))
+        columns = ["table_name", "family", "endpoint", "download_type"]
+        print(f"Étapes: {', '.join(args.stages)}")
+        print(plan[columns].to_string(index=False))
+        raise SystemExit(0)
+
+    validate_runtime_config()
+
     log_version = "v1" if table_cat is None else table_cat
     gcs_client = GCSClient(bucket_name=gcs_raw_bucket_name)
+    lock_ttl = int(os.getenv("PIPELINE_LOCK_TTL_MINUTES", "1440"))
+    execution_lock = gcs_client.bucket_manager.acquire_execution_lock(lock_ttl)
+    atexit.register(execution_lock.release)
     standard_logger.info("Initialisation du client GCS et récupération des configurations pour la mise à jour.")
     configs_for_update = gcs_client.get_configs_for_update()
-    print(f"configs_for_update avant: {configs_for_update}")
     if configs_for_update is None:
-        standard_logger.error("Le fichier de conf est endommagé.")
-        exit()
+        raise RuntimeError("Le fichier de configuration est endommagé")
     standard_logger.info("Fichier de configuration récupéré avec succès.")
     standard_logger.info("Construction des métadonnées à partir des configurations et des noms de tables.")
     metadata = build_metadata(
@@ -257,91 +467,43 @@ if __name__ == "__main__":
     )
     standard_logger.info("Metadata construite avec succès.")
     if metadata.empty:
-        standard_logger.error("Aucune metadata trouvée pour les tables spécifiées.")
-        exit()
+        raise RuntimeError("Aucune metadata trouvée pour les tables spécifiées")
 
     max_workers = args.max_workers
 
-    standard_logger.info("Début de l'exécution du script pour le téléchargement des données Samsara et le chargement dans BigQuery.")
-    start = datetime.now()
-    scrape_samsara_to_gcs(metadata=metadata, iteration=0, max_workers=max_workers)
-    end = datetime.now()
-    td = (end - start).total_seconds()
-    standard_logger.info(
-        f"Temps d'exécution sans les endpoint avec des exceptions: {td} secondes "
-    )
-    print(f"Temps d'exécution : {td} secondes ")
-
-    filters = ["is_exception"]
-    for index, filter_ in enumerate(filters):
-        start = datetime.now()
-        scrape_samsara_to_gcs(
-            metadata=metadata,
-            iteration=index,
-            is_exception=True,
-            max_workers=max_workers,
+    active_stages = [stage for stage in ("download", "transform", "load") if stage in args.stages]
+    standard_logger.info(f"Début des étapes: {active_stages}")
+    total_stages = len(active_stages)
+    completed_stages = 0
+    print_stage_progress(completed_stages, total_stages, "démarrage")
+    if "download" in args.stages:
+        run_download_stage(
+            gcs_client,
+            metadata,
+            configs_for_update,
+            start_date,
+            end_date,
+            max_workers,
         )
-        end = datetime.now()
-        td = (end - start).total_seconds()
-        standard_logger.info(
-            f"Temps d'exécution pour l'exception '{filter_}': {td} secondes "
-        )
-
-    standard_logger.info("Téléchargement des fichiers manquants.")
-    download_missing_files(
-        configs_for_update=configs_for_update,
-        metadata=metadata,
-        start_date=start_date,
-        end_date=end_date,
-        max_workers=max_workers,
-    )
-    gcs_client.update_configs_for_update(metadata=metadata, end_time=end_date, col_to_update=ColumnToUpdate.DOWNLOAD)
-
-    # Récupération et sauvegarde des dates sans données dans le fichier de configuration
-    missing_dates = gcs_client.bucket_manager.missing_dates(
-        metadata=metadata,
-        configs_for_update=configs_for_update,
-        end_date=datetime.strptime(end_date, "%d/%m/%Y"),
-        start_date=datetime.strptime(start_date, "%d/%m/%Y")
-    )
-    standard_logger.info("Dates sans données récupérées avec succès.")
-    gcs_client.update_configs_for_update(
-        metadata=metadata,
-        end_time=end_date,
-        col_to_update=ColumnToUpdate.DATE_NO_DATA,
-        missing_dates=missing_dates
-    )
-    standard_logger.info("Fichier de configuration mis à jour avec les dates sans données.")
-
-    # Transformation des données
-    standard_logger.info("Début de la transformation des données.")
-    gcs_client.transform_and_save_data(
-        target_bucket_name=gcs_flattened_bucket_name,
-        metadata=metadata,
-        configs_for_update=configs_for_update,
-    )
-    standard_logger.info("Transformation des données effectuée avec succès.")
-    gcs_client.update_configs_for_update(
-        metadata=metadata,
-        end_time=end_date,
-        col_to_update=ColumnToUpdate.TRANSFORMATION
-    )
-    standard_logger.info("Fichier de configuration mis à jour avec les données transformées.")
-
-    # Chargement des données dans BigQuery
-    standard_logger.info("Début du chargement des données dans BigQuery.")
-    load_to_bigquery(
-        metadata=metadata,
-        configs_for_update=configs_for_update,
-    )
-    standard_logger.info("Chargement des données dans BigQuery effectué avec succès.")
-    gcs_client.update_configs_for_update(metadata=metadata, end_time=end_date, col_to_update=ColumnToUpdate.DATABASE)
-    standard_logger.info("Fichier de configuration mis à jour avec les données chargées dans BigQuery.")
+        completed_stages += 1
+        print_stage_progress(completed_stages, total_stages, "download terminé")
+    if "transform" in args.stages:
+        run_transform_stage(gcs_client, metadata, configs_for_update, end_date)
+        completed_stages += 1
+        print_stage_progress(completed_stages, total_stages, "transform terminé")
+    if "load" in args.stages:
+        run_load_stage(gcs_client, metadata, configs_for_update, end_date)
+        completed_stages += 1
+        print_stage_progress(completed_stages, total_stages, "load terminé")
 
     # Chargement des logs dans GCS
     upload_logs(log_version)
     standard_logger.info("Logs chargés dans GCS avec succès.")
 
+    cleanup_load_manifest(gcs_client)
+    cleanup_logs(gcs_client)
+
+    execution_lock.release()
+    atexit.unregister(execution_lock.release)
+
     print("----------------------> Fin de l'execution <----------------------")
-    configs_for_update = gcs_client.get_configs_for_update()
-    # print(f"Table names to process: {configs_for_update}")

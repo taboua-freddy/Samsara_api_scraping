@@ -3,5 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-#.env
-#credentials/
+.env
+.env.*
+!.env.example
+credentials/
+resources/
+.git/
+.idea/

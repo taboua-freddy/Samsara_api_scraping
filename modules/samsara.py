@@ -17,6 +17,8 @@ class SamsaraClient:
         rate_limiter: EndpointRateLimiter,
         shared_vars_manager: MemoryAccess = None,
         delta_days: int = 1,
+        timeout: tuple[float, float] = (10, 120),
+        session: requests.Session | None = None,
     ):
         self.api_token: str = api_token
         self.base_url: str = "https://api.eu.samsara.com"
@@ -26,28 +28,37 @@ class SamsaraClient:
         }
         self.rate_limiter: EndpointRateLimiter = rate_limiter
         self.delta_days = delta_days
+        self.timeout = timeout
+        self.session = session or requests.Session()
         self.logger = MyLogger("SamsaraClient")
         self.shared_vars_manager = shared_vars_manager
 
     def get_all_data(
         self, endpoint: str, params: dict = None, max_calls_per_second=5
     ) -> list[dict]:
-        """
-        Récupère toutes les données pour un endpoint donné, en gérant la pagination.
-        :param endpoint: valeur de l'endpoint
-        :param params: paramètres de la requête
-        :param max_calls_per_second: nombre maximal de requêtes par seconde
-        :return:
-        """
+        """Return all pages for compatibility with dynamic endpoint workflows."""
         all_data = []
+        for page, _pagination in self.iter_data_pages(
+            endpoint,
+            params=params,
+            max_calls_per_second=max_calls_per_second,
+        ):
+            all_data.extend(page)
+        return all_data
+
+    def iter_data_pages(
+        self, endpoint: str, params: dict = None, max_calls_per_second=5
+    ):
+        """Yield normalized pages and pagination metadata without accumulating them."""
         url = f"{self.base_url}/{endpoint}"
         has_next_page = True
-        params = params or {}
+        params = (params or {}).copy()
         max_retries = 5
 
         while has_next_page:
             retry_count = 0
             success = False
+            last_error = None
 
             while not success and retry_count < max_retries:
                 self.rate_limiter.acquire(endpoint, max_calls_per_second)
@@ -55,30 +66,25 @@ class SamsaraClient:
                     self.logger.info(
                         f"Demande de données à {url} avec les paramètres {params}"
                     )
-                    response = requests.get(url, headers=self.headers, params=params)
+                    response = self.session.get(
+                        url,
+                        headers=self.headers,
+                        params=params,
+                        timeout=self.timeout,
+                    )
                     # Gère le succès et les erreurs spécifiques de la requête
                     if response.status_code == 200:
                         data = response.json()
                         self.logger.info(
                             f"Données récupérées avec succès pour {url} et les paramètres {params}"
                         )
-                        if data.get("data", None) is None:
-                            # si la réponse n'a pas l'attribut 'data' et est juste un dictionnaire
-                            if isinstance(data, dict):
-                                all_data.append(data)
-                        if d := data.get("data", []):
-                            # si la réponse à l'attribut 'data' mais est un dictionnaire
-                            if isinstance(d, dict):
-                                keys = list(d.keys())
-                                if len(keys) == 1 and isinstance(d[keys[0]], list):
-                                    d = d[list(d.keys())[0]]
-                                else:
-                                    d = [d]
-                            all_data.extend(d)
                         success = True
                     # Code 429 (trop de requêtes) déclenche une attente pour le retry
                     elif response.status_code == 429:
                         retry_after = float(response.headers.get("Retry-After", 1))
+                        last_error = RuntimeError(
+                            f"Limite de requêtes atteinte pour {url}"
+                        )
                         self.logger.warning(
                             f"Reçu code 429, attente de {retry_after} secondes pour {url} et les paramètres {params}"
                         )
@@ -90,7 +96,11 @@ class SamsaraClient:
                         )
                         response.raise_for_status()
                 except requests.exceptions.RequestException as e:
+                    last_error = e
                     self.logger.error(f"Exception lors de la requête: {e}")
+                    status_code = getattr(getattr(e, "response", None), "status_code", None)
+                    if status_code is not None and 400 <= status_code < 500:
+                        raise
                     retry_count += 1
                     sleep_time = 2**retry_count
                     self.logger.info(f"Nouvelle tentative dans {sleep_time} secondes")
@@ -100,10 +110,12 @@ class SamsaraClient:
                 self.logger.error(
                     f"Échec après plusieurs tentatives, arrêt du traitement pour {url} et les paramètres {params}"
                 )
-                break
-            # Gestion de la pagination pour récupérer toutes les pages
-
+                raise RuntimeError(
+                    f"Échec de l'appel Samsara après {max_retries} tentatives: {url}"
+                ) from last_error
+            page = self._normalize_page(data)
             pagination = data.get("pagination", {})
+            yield page, pagination
             has_next_page = pagination.get("hasNextPage", False)
             end_cursor = pagination.get("endCursor")
             if has_next_page and end_cursor:
@@ -111,6 +123,16 @@ class SamsaraClient:
                 params["after"] = end_cursor
             else:
                 has_next_page = False
-                # self.shared_vars_manager.alter_value(set_metadata_is_processed,"metadata", endpoint=endpoint, is_processed=1, params=params)
 
-        return all_data
+    @staticmethod
+    def _normalize_page(payload: dict) -> list[dict]:
+        if payload.get("data") is None:
+            return [payload] if isinstance(payload, dict) else []
+        data = payload.get("data", [])
+        if isinstance(data, dict):
+            keys = list(data.keys())
+            if len(keys) == 1 and isinstance(data[keys[0]], list):
+                data = data[keys[0]]
+            else:
+                data = [data]
+        return data

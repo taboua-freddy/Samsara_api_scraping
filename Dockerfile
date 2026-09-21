@@ -1,4 +1,4 @@
-FROM python:3.11-alpine
+FROM python:3.12-slim
 LABEL authors="taboua-freddy"
 
 # Dépendances système (optionnel selon ton code)
@@ -9,16 +9,23 @@ WORKDIR /app
 
 # Copier les fichiers
 COPY requirements.txt .
-COPY main.py .
-COPY modules/ ./modules/
-COPY credentials/ ./credentials/
-COPY .env .env
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
-# Installer les dépendances
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN addgroup --system app \
+    && adduser --system --ingroup app app \
+    && mkdir -p /app/resources/logs /app/resources/tmp /app/resources/data \
+    && chown -R app:app /app
+
+COPY --chown=app:app main.py .
+COPY --chown=app:app modules/ ./modules/
+COPY --chown=app:app scripts/ ./scripts/
+COPY --chown=app:app config/ ./config/
 
 # Variables d’environnement
 ENV PYTHONUNBUFFERED=1
 
-# Point d’entrée
-CMD ["python", "main.py"]
+USER app
+
+# Point d’entrée : les arguments Docker/Cloud Run sont transmis à main.py.
+ENTRYPOINT ["python", "main.py"]

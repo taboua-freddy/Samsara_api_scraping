@@ -1,6 +1,6 @@
-import os.path
-from typing import Literal
-
+import ast
+import hashlib
+import json
 import os.path
 from datetime import datetime, timedelta
 from typing import Literal
@@ -8,23 +8,35 @@ from typing import Literal
 import pytz
 
 from .gcp import GCSClient
-from .logs import MyLogger
 from .samsara import SamsaraClient
 from .transformation import TransformData
-from .transformation_configs import transformation_configs
 from .utils import (
-    flatten_data,
-    parquet_buffer,
-    parallelize_execution,
-    get_start_end_date_config,
-    date_to_iso_or_timestamp,
-    process_params,
-    timestamp_ms_to_timestamp,
     DEFAULT_RATE_LIMIT_SECOND,
+    date_to_iso_or_timestamp,
+    flatten_data,
+    get_start_end_date_config,
+    parallelize_execution,
+    parquet_buffer,
+    process_params,
     split_list,
-    DATA_DIR,
+    timestamp_ms_to_timestamp,
 )
 from .utils_transformation import *
+
+
+def _parse_exception_config(config: dict | str) -> dict:
+    """Parse legacy string configs without executing arbitrary code."""
+    if isinstance(config, dict):
+        return config
+    if isinstance(config, str):
+        try:
+            parsed = json.loads(config)
+        except json.JSONDecodeError:
+            parsed = ast.literal_eval(config)
+        if not isinstance(parsed, dict):
+            raise ValueError("exception_config doit contenir un dictionnaire")
+        return parsed
+    raise ValueError("exception_config doit être un dictionnaire")
 
 
 class DataFetcher:
@@ -45,6 +57,12 @@ class DataFetcher:
         self.endpoint_info: dict = endpoint_info
         self.logger = self.samsara_client.logger
         self.max_workers = kwargs.get("max_workers")
+        self.chunk_rows = int(os.getenv("SAMSARA_CHUNK_ROWS", "50000"))
+        if self.chunk_rows < 1:
+            raise ValueError("SAMSARA_CHUNK_ROWS doit être supérieur ou égal à 1")
+        self.chunk_pages = int(os.getenv("SAMSARA_CHUNK_PAGES", "25"))
+        if self.chunk_pages < 1:
+            raise ValueError("SAMSARA_CHUNK_PAGES doit être supérieur ou égal à 1")
 
     def fetch_and_upload(self, *args, **kwargs):
         """
@@ -80,15 +98,14 @@ class DataFetcher:
             self.logger.error(
                 f"Erreur lors de la conversion des paramètres pour {self.endpoint_info.get('table_name')}: {e}"
             )
-            return
+            raise
 
         is_list = None
         endpoints = []
         # Gestion des urls avec des paramètres dynamiques (endpoint/{id}) ou des urls qui dépendent des données d'autres endpoints
         exception_config = self.endpoint_info.get("exception_config", {})
         if self.endpoint_info.get("is_exception", False):
-            if isinstance(exception_config, str):
-                exception_config = eval(exception_config)
+            exception_config = _parse_exception_config(exception_config)
             table_name_to_get = exception_config.get(
                 "table_name"
             )  # table à partir de laquelle récupérer les données
@@ -123,10 +140,11 @@ class DataFetcher:
                         )
 
                 if not downloaded_files:
-                    self.logger.error(
+                    message = (
                         f"Aucune donnée trouvée pour la table {table_name_to_get} pour l'endpoint {self.endpoint_info.get('endpoint')}"
                     )
-                    return
+                    self.logger.error(message)
+                    raise RuntimeError(message)
 
                 process_exception = True
 
@@ -184,7 +202,9 @@ class DataFetcher:
                 process_exception = True
 
             if not process_exception:
-                return
+                raise ValueError(
+                    f"Configuration d'exception non prise en charge: {exception_config}"
+                )
 
         if not endpoint_infos:
             endpoint_infos.append(self.endpoint_info)
@@ -200,7 +220,7 @@ class DataFetcher:
                 self.logger.error(
                     f"Erreur lors de la conversion des paramètres pour {self.endpoint_info.get('table_name')}: {e}"
                 )
-                return
+                raise
 
             # Par défaut, l'intervalle de recupération est de 1 jour
             # on peut le modifier dans les paramètres de l'endpoint et cette valeur qui fait fois si elle existe
@@ -261,8 +281,7 @@ class DataFetcher:
                         return  # on sort de la fonction pour éviter de traiter les données normalement
 
                 # endpoints marqués date mais qui sont datetime
-                if isinstance(exception_config, str):
-                    exception_config = eval(exception_config)
+                exception_config = _parse_exception_config(exception_config)
                 if all(
                     [
                         self.endpoint_info.get("is_exception", False),
@@ -309,17 +328,16 @@ class DataFetcher:
                 )
             else:
                 # Récupération des données pour les endpoints sans date dans les paramètres
-                data = self.samsara_client.get_all_data(
+                file_name = f'{self.endpoint_info.get("table_name")}'
+                self._stream_and_upload(
                     endpoint=self.endpoint_info.get("endpoint"),
                     params=params,
+                    file_name=file_name,
+                    date_str="",
                     max_calls_per_second=self.endpoint_info.get(
                         "rate_limit_per_seconde"
                     ),
                 )
-
-                # date_str = datetime.now().strftime("%Y_%m_%d")
-                file_name = f'{self.endpoint_info.get("table_name")}' # _{date_str}
-                self._flatten_and_upload(data, file_name, date_str="")
 
     def _fetch_data_for_interval(self, **kwargs):
         # params: dict, start_time: str, end_time: str
@@ -362,7 +380,7 @@ class DataFetcher:
                 self.logger.error(
                     f"Erreur lors de la conversion des dates en timestamp: {e}"
                 )
-                return
+                raise
         date_str = self._date_str(start_time, end_time)
 
         self.logger.info(
@@ -370,33 +388,35 @@ class DataFetcher:
         )
         try:
             # la boucle for gére des données pour les endpoints multiples de la forme /endpoint/{id}
-            for index, endpoint in enumerate(endpoints):
-                file_name = f'{self.endpoint_info.get("table_name")}_{date_str}_{index}'
-                params.update({"endpoint": endpoint})
-                data = self.samsara_client.get_all_data(
-                    endpoint=endpoint,
-                    params=params,
-                    max_calls_per_second=self.endpoint_info.get(
-                        "rate_limit_per_seconde", DEFAULT_RATE_LIMIT_SECOND
-                    ),
-                )
-                self._flatten_and_upload(data, file_name, date_str)
-
+            if endpoints:
+                for index, endpoint in enumerate(endpoints):
+                    file_name = f'{self.endpoint_info.get("table_name")}_{date_str}_{index}'
+                    endpoint_params = params.copy()
+                    data = self.samsara_client.get_all_data(
+                        endpoint=endpoint,
+                        params=endpoint_params,
+                        max_calls_per_second=self.endpoint_info.get(
+                            "rate_limit_per_seconde", DEFAULT_RATE_LIMIT_SECOND
+                        ),
+                    )
+                    self._flatten_and_upload(data, file_name, date_str)
             else:
                 file_name = f'{self.endpoint_info.get("table_name")}_{date_str}'
-                data = self.samsara_client.get_all_data(
+                self._stream_and_upload(
                     endpoint=self.endpoint_info.get("endpoint"),
                     params=params,
+                    file_name=file_name,
+                    date_str=date_str,
                     max_calls_per_second=self.endpoint_info.get(
                         "rate_limit_per_seconde", DEFAULT_RATE_LIMIT_SECOND
                     ),
                 )
-                self._flatten_and_upload(data, file_name, date_str)
 
         except Exception as e:
             self.logger.error(
                 f"Erreur lors de la récupération pour table : {self.endpoint_info.get('table_name')}, date : {date_str}, params : {params} exception : {e}"
             )
+            raise
 
     def _date_str(self, start_time: str, end_time: str):
         if self.samsara_client.delta_days == 1:
@@ -423,14 +443,127 @@ class DataFetcher:
         )
         self._flatten_and_upload(data, file_name, date_str)
 
-    def _flatten_and_upload(self, data: list[dict], file_name: str, date_str: str):
+    def _stream_and_upload(
+        self,
+        endpoint: str,
+        params: dict,
+        file_name: str,
+        date_str: str,
+        max_calls_per_second: int | float,
+    ) -> None:
+        state_identity = f'{self.endpoint_info.get("folder_path")}/{file_name}|{endpoint}'
+        state_key = hashlib.sha256(state_identity.encode("utf-8")).hexdigest()
+        state = self.gcs_client.get_extraction_manifest().get(state_key, {})
+        uploaded_files = state.get("uploaded_files", [])
+        files_are_present = all(
+            self.gcs_client.bucket_manager.file_exists(path)[0]
+            for path in uploaded_files
+        )
+        if state.get("status") == "complete" and files_are_present:
+            self.logger.info(f"Extraction déjà complète pour {state_identity}")
+            return
+        if state.get("status") == "complete" and not files_are_present:
+            state = {}
+            uploaded_files = []
+
+        request_params = params.copy()
+        if cursor := state.get("next_cursor"):
+            request_params["after"] = cursor
+        chunk_index = int(state.get("next_chunk_index", 1))
+        rows_written = int(state.get("rows_written", 0))
+        buffered_rows = []
+        next_cursor = state.get("next_cursor")
+        pages_processed = 0
+        pages_in_chunk = 0
+
+        for page, pagination in self.samsara_client.iter_data_pages(
+            endpoint=endpoint,
+            params=request_params,
+            max_calls_per_second=max_calls_per_second,
+        ):
+            pages_processed += 1
+            pages_in_chunk += 1
+            buffered_rows.extend(page)
+            next_cursor = (
+                pagination.get("endCursor")
+                if pagination.get("hasNextPage", False)
+                else None
+            )
+            print(
+                f"\r[{self.endpoint_info.get('table_name')}] "
+                f"pages={pages_processed} chunks={chunk_index - 1} "
+                f"objets={rows_written + len(buffered_rows)}",
+                end="",
+                flush=True,
+            )
+            if (
+                len(buffered_rows) >= self.chunk_rows
+                or pages_in_chunk >= self.chunk_pages
+            ):
+                destination = self._flatten_and_upload(
+                    buffered_rows,
+                    f"{file_name}_{chunk_index:05d}",
+                    date_str,
+                )
+                if destination:
+                    uploaded_files.append(destination)
+                rows_written += len(buffered_rows)
+                chunk_index += 1
+                buffered_rows = []
+                pages_in_chunk = 0
+                if next_cursor:
+                    self.gcs_client.update_extraction_state(
+                        state_key,
+                        {
+                            "identity": state_identity,
+                            "status": "in_progress",
+                            "next_cursor": next_cursor,
+                            "next_chunk_index": chunk_index,
+                            "rows_written": rows_written,
+                            "uploaded_files": uploaded_files,
+                            "updated_at": datetime.now().isoformat(),
+                        },
+                    )
+
+        if buffered_rows:
+            destination = self._flatten_and_upload(
+                buffered_rows,
+                f"{file_name}_{chunk_index:05d}",
+                date_str,
+            )
+            if destination:
+                uploaded_files.append(destination)
+            rows_written += len(buffered_rows)
+            chunk_index += 1
+
+        self.gcs_client.update_extraction_state(
+            state_key,
+            {
+                "identity": state_identity,
+                "status": "complete",
+                "next_cursor": None,
+                "next_chunk_index": chunk_index,
+                "rows_written": rows_written,
+                "uploaded_files": uploaded_files,
+                "updated_at": datetime.now().isoformat(),
+            },
+        )
+        print(
+            f"\r[{self.endpoint_info.get('table_name')}] terminé: "
+            f"pages={pages_processed} chunks={len(uploaded_files)} "
+            f"objets={rows_written}"
+        )
+
+    def _flatten_and_upload(
+        self, data: list[dict], file_name: str, date_str: str
+    ) -> str | None:
         if data:
             df = flatten_data(data)
             if df.empty:
                 self.logger.info(
                     f"Aucune donnée pour le {date_str} de la table {self.endpoint_info.get('table_name')}, endpoint: {self.endpoint_info.get('endpoint')}"
                 )
-                return
+                return None
 
             if self.endpoint_info.get("table_name") == "fleet_vehicles_fuel_energy":
                 # On traite la table fleet_vehicles_fuel_energy de manière spécifique
@@ -443,9 +576,11 @@ class DataFetcher:
             )
             buffer = parquet_buffer(df)
             self.gcs_client.upload_bytes(buffer, destination_blob_name)
+            return destination_blob_name
 
         else:
             self.logger.info(
                 f"Aucune donnée pour le {date_str} de la table {self.endpoint_info.get('table_name')}"
             )
+        return None
 

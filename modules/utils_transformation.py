@@ -1,7 +1,7 @@
 import gc
 import json
 from multiprocessing import Pool, cpu_count
-from typing import Any, Optional, Generator
+from typing import Any, Generator, Optional
 
 import numpy as np
 import pandas as pd
@@ -51,7 +51,7 @@ def fast_json_normalize_parallel(
 
     args = [
         (record, base, sep, prefix, record_prefix)
-        for record, base in zip(df_valid[record_path], meta_data)
+        for record, base in zip(df_valid[record_path], meta_data, strict=True)
     ]
 
     with Pool(processes=n_processes) as pool:

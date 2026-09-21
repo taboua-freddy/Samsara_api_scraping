@@ -1,8 +1,7 @@
 import pandas as pd
 
-from .transformation_configs import transformation_configs
 from .logs import MyLogger
-
+from .transformation_configs import transformation_configs
 from .utils_transformation import *
 
 
@@ -71,8 +70,7 @@ class TransformData:
         step_config = {}
         try:
             # self.logger.info(f"Taille initiale du DataFrame: {self.df.shape if isinstance(self.df, pd.DataFrame) else {k: v.shape for k, v in self.df.items()}}")
-            n_configs = len(config)
-            for step, step_config in config.items():
+            for _step, step_config in config.items():
                 function_name = step_config.get("function")
                 # self.logger.info(
                 #     f"Transformation étape: {step}/{n_configs} - Table: {self.endpoint_info.get('table_name')} - Fonction: {function_name}"
@@ -95,6 +93,7 @@ class TransformData:
             self.logger.error(
                 f"Erreur lors de la transformation des données: {e} pour la table {self.endpoint_info.get('table_name')} avec la fonction {function_name} et la configuration {step_config}"
             )
+            raise
         return self.df
 
     def split_data(self, df: pd.DataFrame, table_name: str, **kwargs) -> dict[str, pd.DataFrame]:

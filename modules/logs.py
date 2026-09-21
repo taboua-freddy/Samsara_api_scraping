@@ -15,6 +15,8 @@ class MyLogger:
     def __init__(self, name: str, with_console: bool = False, with_file: bool = True):
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging.DEBUG)
+        if getattr(self.logger, "_samsara_configured", False):
+            return
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         # Gestionnaire pour l'affichage console
         if with_console:
@@ -43,6 +45,7 @@ class MyLogger:
             error_handler.setLevel(logging.ERROR)
             error_handler.setFormatter(formatter)
             self.logger.addHandler(error_handler)
+        self.logger._samsara_configured = True
 
     def info(self, message: str):
         self.logger.info(message)
