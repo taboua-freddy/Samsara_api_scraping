@@ -476,7 +476,10 @@
       "exception_type": "table",
       "constraint": "dynamic_url",
       "table_name": "fleet_vehicles",
-      "table_column_name": "vehicle_id",
+      "table_column_name": "id",
+      "table_column_aliases": [
+        "vehicle_id"
+      ],
       "exception_param_name": "vehicleId",
       "key_to_apply_on": "endpoint",
       "is_list": 0

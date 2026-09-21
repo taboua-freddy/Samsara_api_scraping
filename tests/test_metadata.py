@@ -75,3 +75,17 @@ class MetadataValidationTests(unittest.TestCase):
         )
         rendered = frame["params"].dropna().astype(str)
         self.assertFalse(rendered.str.contains(r"\$\{", regex=True).any())
+
+    def test_dynamic_dependencies_use_raw_ids_with_transformed_aliases(self):
+        frame = metadata_module.make_meta_data("18/09/2026", "19/09/2026")
+        by_name = frame.set_index("table_name")
+
+        safety_config = by_name.loc[
+            "fleet_vehicle_safety_score", "exception_config"
+        ]
+        self.assertEqual(safety_config["table_column_name"], "id")
+        self.assertIn("vehicle_id", safety_config["table_column_aliases"])
+
+        alerts_config = by_name.loc["alerts_incidents", "exception_config"]
+        self.assertEqual(alerts_config["table_column_name"], "id")
+        self.assertIn("configurationId", alerts_config["table_column_aliases"])
