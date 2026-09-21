@@ -212,7 +212,11 @@
       "exception_type": "table",
       "constraint": "dynamic_url",
       "table_name": "alerts_configurations",
-      "table_column_name": "vehicle_id",
+      "table_column_name": "id",
+      "table_column_aliases": [
+        "configuration_id",
+        "configurationId"
+      ],
       "exception_param_name": "configurationIds",
       "key_to_apply_on": "params",
       "is_list": 1

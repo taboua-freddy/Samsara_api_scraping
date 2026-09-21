@@ -1,7 +1,15 @@
+import os
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from modules.processing import DataFetcher, _parse_exception_config
+import pandas as pd
+
+from modules.processing import (
+    DataFetcher,
+    _parse_exception_config,
+    _read_dependency_values,
+)
 
 
 class ExceptionConfigTests(unittest.TestCase):
@@ -21,6 +29,34 @@ class ExceptionConfigTests(unittest.TestCase):
 
 
 class DynamicEndpointTests(unittest.TestCase):
+    def test_dependency_values_accept_variable_parquet_schemas_and_aliases(self):
+        logger = Mock()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            without_key = os.path.join(temp_dir, "without_key.parquet")
+            with_key = os.path.join(temp_dir, "with_key.parquet")
+            with_alias = os.path.join(temp_dir, "with_alias.parquet")
+            pd.DataFrame({"name": ["A"]}).to_parquet(without_key)
+            pd.DataFrame({"id": ["1", "2"]}).to_parquet(with_key)
+            pd.DataFrame({"configurationId": ["2", "3"]}).to_parquet(with_alias)
+
+            values = _read_dependency_values(
+                [without_key, with_key, with_alias],
+                "id",
+                ["configurationId"],
+                logger,
+            )
+
+        self.assertEqual(values, ["1", "2", "3"])
+        logger.warning.assert_called_once()
+
+    def test_dependency_values_report_all_schemas_when_key_is_absent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_name = os.path.join(temp_dir, "without_key.parquet")
+            pd.DataFrame({"name": ["A"]}).to_parquet(file_name)
+
+            with self.assertRaisesRegex(RuntimeError, "Schémas détectés"):
+                _read_dependency_values([file_name], "id", ["configurationId"])
+
     def test_does_not_call_base_endpoint_after_dynamic_endpoints(self):
         client = Mock(delta_days=1)
         client.get_all_data.return_value = [{"id": 1}]

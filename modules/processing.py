@@ -5,6 +5,7 @@ import os.path
 from datetime import datetime, timedelta
 from typing import Literal
 
+import pyarrow.parquet as pq
 import pytz
 
 from .gcp import GCSClient
@@ -37,6 +38,53 @@ def _parse_exception_config(config: dict | str) -> dict:
             raise ValueError("exception_config doit contenir un dictionnaire")
         return parsed
     raise ValueError("exception_config doit être un dictionnaire")
+
+
+def _read_dependency_values(
+    file_names: list[str],
+    column_name: str,
+    column_aliases: list[str] | None = None,
+    logger=None,
+) -> list:
+    """Read a routing key from Parquet files whose schemas may differ.
+
+    Files without any usable key are ignored: their source data remains intact,
+    but they cannot be used to build a dynamic API request.  A clear error is
+    raised only when none of the files contains the requested key or an alias.
+    """
+    candidates = list(dict.fromkeys([column_name, *(column_aliases or [])]))
+    values = []
+    schemas = {}
+
+    for file_name in file_names:
+        available_columns = pq.ParquetFile(file_name).schema_arrow.names
+        schemas[os.path.basename(file_name)] = available_columns
+        source_column = next(
+            (candidate for candidate in candidates if candidate in available_columns),
+            None,
+        )
+        if source_column is None:
+            if logger:
+                logger.warning(
+                    "Fichier Parquet ignoré pour la résolution de la dépendance "
+                    f"'{column_name}': {file_name}. Colonnes disponibles: "
+                    f"{available_columns}"
+                )
+            continue
+
+        series = pd.read_parquet(file_name, columns=[source_column])[source_column]
+        values.extend(series.dropna().tolist())
+
+    if not values:
+        raise RuntimeError(
+            f"Aucune valeur trouvée pour la colonne '{column_name}' "
+            f"(alias acceptés: {candidates[1:]}) dans les fichiers de dépendance. "
+            f"Schémas détectés: {schemas}"
+        )
+
+    # dict preserves the source order and avoids pandas/Arrow type coercion
+    # while combining chunks with heterogeneous schemas.
+    return list(dict.fromkeys(values))
 
 
 class DataFetcher:
@@ -112,6 +160,7 @@ class DataFetcher:
             column_to_get = exception_config.get(
                 "table_column_name"
             )  # colonne à récupérer
+            column_aliases = exception_config.get("table_column_aliases", [])
             exception_param_name = exception_config.get(
                 "exception_param_name"
             )  # element à modifier dans les paramètres
@@ -148,14 +197,12 @@ class DataFetcher:
 
                 process_exception = True
 
-                df = pd.concat(
-                    [
-                        pd.read_parquet(file_name, columns=[column_to_get])
-                        for file_name in downloaded_files
-                    ]
+                data = _read_dependency_values(
+                    downloaded_files,
+                    column_to_get,
+                    column_aliases=column_aliases,
+                    logger=self.logger,
                 )
-                df = df.drop_duplicates(subset=[column_to_get])
-                data = df[column_to_get].tolist()
 
                 if is_list:
                     # si c'est une liste, on met les données dans une seule chaine de caractères
@@ -166,7 +213,7 @@ class DataFetcher:
                     for chunk in split_list(data, chunk_size):
                         if isinstance(param_to_alter, str):
                             temp_endpoint_info = self.endpoint_info.copy()
-                            array_to_str_chunk = ",".join(chunk)
+                            array_to_str_chunk = ",".join(map(str, chunk))
                             temp_endpoint_info.update(
                                 {
                                     key_to_apply_on: param_to_alter.format(

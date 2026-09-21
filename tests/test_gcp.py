@@ -1,8 +1,10 @@
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from google.api_core.exceptions import Conflict
+from google.resumable_media.common import InvalidResponse
 
 from modules.gcp import (
     BigQueryManager,
@@ -77,6 +79,32 @@ class LoadManifestTests(unittest.TestCase):
         self.assertEqual(
             merged["table"]["missing"], ["01/01/2025", "02/01/2025"]
         )
+
+    def test_retries_resumable_412_generation_conflict(self):
+        response = Mock(status_code=412)
+        conflict = InvalidResponse(response, "precondition failed")
+        blob = Mock(generation=7)
+        blob.exists.return_value = True
+        blob.download_as_bytes.return_value = b'{"existing": true}'
+        blob.upload_from_file.side_effect = [conflict, None]
+        manager = Mock()
+        manager.gcs_config_path = "resources/configs"
+        manager.bucket.blob.return_value = blob
+        client = GCSClient.__new__(GCSClient)
+        client.bucket_manager = manager
+        client._config_lock = threading.RLock()
+
+        with (
+            patch("modules.gcp.random.uniform", return_value=0),
+            patch("modules.gcp.time.sleep") as sleep,
+        ):
+            result = client._mutate_config(
+                "manifest", lambda current: {**current, "updated": True}
+            )
+
+        self.assertEqual(result, {"existing": True, "updated": True})
+        self.assertEqual(blob.upload_from_file.call_count, 2)
+        sleep.assert_called_once_with(0.25)
 
     def test_cleanup_removes_only_safe_manifest_entries(self):
         manifest = {

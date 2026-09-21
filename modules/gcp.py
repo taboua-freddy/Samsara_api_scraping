@@ -1,8 +1,11 @@
 import hashlib
 import json
 import os
+import random
 import re
 import socket
+import threading
+import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +18,7 @@ import pyarrow.parquet as pq
 from google.api_core.exceptions import Conflict, PreconditionFailed
 from google.cloud import bigquery, storage
 from google.cloud.exceptions import NotFound
+from google.resumable_media.common import InvalidResponse
 
 from .interface import ColumnToUpdate, DownloadType, SearchRetrieveType
 from .logs import MyLogger
@@ -47,6 +51,13 @@ def build_load_fingerprint(
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+def _is_generation_conflict(exc: Exception) -> bool:
+    if isinstance(exc, PreconditionFailed):
+        return True
+    response = getattr(exc, "response", None)
+    return isinstance(exc, InvalidResponse) and getattr(response, "status_code", None) == 412
+
+
 class ExecutionLock:
     """Atomic, expiring GCS lock used to prevent concurrent pipeline runs."""
 
@@ -69,7 +80,9 @@ class ExecutionLock:
                 content_type="application/json",
                 if_generation_match=0,
             )
-        except PreconditionFailed:
+        except (PreconditionFailed, InvalidResponse) as exc:
+            if not _is_generation_conflict(exc):
+                raise
             self.blob.reload()
             existing = json.loads(self.blob.download_as_text())
             expires_at = datetime.fromisoformat(existing["expires_at"])
@@ -610,6 +623,7 @@ class GCSClient:
 
     def __init__(self, bucket_name: str):
         self.bucket_manager = BucketManager(bucket_name)
+        self._config_lock = threading.RLock()
 
     @property
     def target_bucket_manager(self) -> BucketManager:
@@ -701,36 +715,45 @@ class GCSClient:
         self, filename: str, mutator: Callable[[dict], dict]
     ) -> dict:
         """Atomically mutate a JSON config, retrying on generation conflicts."""
-        blob_name = f"{self.bucket_manager.gcs_config_path}/{filename}.json"
-        blob = self.bucket_manager.bucket.blob(blob_name)
-        max_attempts = 5
-        for attempt in range(max_attempts):
-            generation = 0
-            current = {}
-            if blob.exists():
-                blob.reload()
-                generation = blob.generation
-                current = json.loads(
-                    blob.download_as_bytes(if_generation_match=generation)
-                )
+        with self._config_lock:
+            blob_name = f"{self.bucket_manager.gcs_config_path}/{filename}.json"
+            blob = self.bucket_manager.bucket.blob(blob_name)
+            max_attempts = 8
+            for attempt in range(max_attempts):
+                generation = 0
+                current = {}
+                if blob.exists():
+                    blob.reload()
+                    generation = blob.generation
+                    current = json.loads(
+                        blob.download_as_bytes(if_generation_match=generation)
+                    )
 
-            updated = mutator(current)
-            buffer = BytesIO(json.dumps(updated, indent=4).encode("utf-8"))
-            try:
-                blob.upload_from_file(
-                    buffer,
-                    content_type="application/json",
-                    if_generation_match=generation,
-                )
-                return updated
-            except PreconditionFailed as exc:
-                if attempt == max_attempts - 1:
-                    raise RuntimeError(
-                        f"Conflit persistant lors de la mise à jour de {blob_name}"
-                    ) from exc
-                self.bucket_manager.logger.warning(
-                    f"Conflit de génération pour {blob_name}, nouvelle tentative"
-                )
+                updated = mutator(current)
+                buffer = BytesIO(json.dumps(updated, indent=4).encode("utf-8"))
+                try:
+                    blob.upload_from_file(
+                        buffer,
+                        content_type="application/json",
+                        if_generation_match=generation,
+                    )
+                    return updated
+                except (PreconditionFailed, InvalidResponse) as exc:
+                    if not _is_generation_conflict(exc):
+                        raise
+                    if attempt == max_attempts - 1:
+                        raise RuntimeError(
+                            f"Conflit persistant lors de la mise à jour de {blob_name}"
+                        ) from exc
+                    delay = min(
+                        0.25 * (2**attempt) + random.uniform(0, 0.25),
+                        4.0,
+                    )
+                    self.bucket_manager.logger.warning(
+                        f"Conflit de génération pour {blob_name}; "
+                        f"nouvelle tentative dans {delay:.2f}s"
+                    )
+                    time.sleep(delay)
         raise RuntimeError(f"Impossible de mettre à jour {blob_name}")
 
     @staticmethod
