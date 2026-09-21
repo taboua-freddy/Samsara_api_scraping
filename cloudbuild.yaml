@@ -1,0 +1,63 @@
+substitutions:
+  _REGION: europe-west1
+  _REPOSITORY: pipelines-test
+  _JOB_NAME: samsara-pipeline-test
+  _RUNTIME_SERVICE_ACCOUNT: samsara-pipeline-test@maintenance-predictive-445011.iam.gserviceaccount.com
+  _RAW_BUCKET: raw-samsara-data-test-maintenance-predictive-445011
+  _FLATTENED_BUCKET: samsara-data-flattened-test-maintenance-predictive-445011
+  _DATASET_ID: dwh_samsara_test
+  _SAMSARA_SECRET: samsara-api-token-test
+
+steps:
+  - id: validate-test-scope
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        for value in "${_JOB_NAME}" "${_RAW_BUCKET}" "${_FLATTENED_BUCKET}" "${_DATASET_ID}" "${_SAMSARA_SECRET}"; do
+          [[ "$value" == *test* ]] || { echo "Ressource hors périmètre test refusée: $value"; exit 1; }
+        done
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --tag
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/samsara-api-scraping:${COMMIT_SHA}
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/samsara-api-scraping:${COMMIT_SHA}
+
+  - id: deploy-job
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - deploy
+      - ${_JOB_NAME}
+      - --project=${PROJECT_ID}
+      - --region=${_REGION}
+      - --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/samsara-api-scraping:${COMMIT_SHA}
+      - --service-account=${_RUNTIME_SERVICE_ACCOUNT}
+      - --tasks=1
+      - --max-retries=1
+      - --task-timeout=24h
+      - --cpu=2
+      - --memory=4Gi
+      - --set-env-vars=GCS_RAW_BUCKET_NAME=${_RAW_BUCKET},GCS_FLATTENED_BUCKET_NAME=${_FLATTENED_BUCKET},DATABASE_ID=${_DATASET_ID},SAMSARA_CHUNK_ROWS=50000,SAMSARA_CHUNK_PAGES=25,BIGQUERY_MANIFEST_RETENTION_DAYS=30,LOG_RETENTION_DAYS=30,PIPELINE_LOCK_TTL_MINUTES=1440
+      - --set-secrets=SAMSARA_API_TOKEN=${_SAMSARA_SECRET}:latest
+      - --args=--lookback-days=1,--table_file_path=ALL
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/samsara-api-scraping:${COMMIT_SHA}
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s
