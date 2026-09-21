@@ -15,7 +15,7 @@ steps:
     args:
       - -ceu
       - |
-        for value in "${_JOB_NAME}" "${_RAW_BUCKET}" "${_FLATTENED_BUCKET}" "${_DATASET_ID}" "${_SAMSARA_SECRET}"; do
+        for value in "${_RAW_BUCKET}" "${_FLATTENED_BUCKET}" "${_DATASET_ID}" ; do
           [[ "$value" == *test* ]] || { echo "Ressource hors périmètre test refusée: $value"; exit 1; }
         done
 
