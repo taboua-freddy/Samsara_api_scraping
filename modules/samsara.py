@@ -32,7 +32,7 @@ class SamsaraClient:
         self.session = session or requests.Session()
         # Cloud Run only captures stdout/stderr while the job is running.  Keep
         # file logs as before, and mirror API progress to the console as well.
-        self.logger = MyLogger("SamsaraClient", with_console=True)
+        self.logger = MyLogger("SamsaraClient")
         self.shared_vars_manager = shared_vars_manager
 
     def get_all_data(
