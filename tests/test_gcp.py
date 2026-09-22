@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
+import pandas as pd
 from google.api_core.exceptions import Conflict
 from google.resumable_media.common import InvalidResponse
 
@@ -182,6 +183,49 @@ class ChunkPathTests(unittest.TestCase):
             manager.parse_file_path(path, SearchRetrieveType.DATE_START), "2026_09_18"
         )
         self.assertEqual(manager.parse_file_path(path, SearchRetrieveType.INDEX), "00001")
+
+    def test_subday_chunk_path_preserves_table_and_dates(self):
+        manager = BucketManager.__new__(BucketManager)
+        manager.file_path_regex = BucketManager.FILE_PATH_REGEX
+        path = (
+            "assets/fleet_assets_reefers/"
+            "fleet_assets_reefers_2026_09_21_000000_to_"
+            "2026_09_21_055959_00001.parquet"
+        )
+        self.assertEqual(manager.get_table_name(path), "fleet_assets_reefers")
+        self.assertEqual(
+            manager.parse_file_path(path, SearchRetrieveType.DATE_START),
+            "2026_09_21",
+        )
+        self.assertEqual(
+            manager.parse_file_path(path, SearchRetrieveType.DATE_END),
+            "2026_09_21",
+        )
+        self.assertEqual(manager.parse_file_path(path, SearchRetrieveType.INDEX), "00001")
+
+    def test_subday_file_counts_as_present_for_its_calendar_day(self):
+        manager = BucketManager.__new__(BucketManager)
+        manager.list_parquet_files = Mock(
+            return_value=[
+                "assets/fleet_assets_reefers/"
+                "fleet_assets_reefers_2026_09_21_000000_to_"
+                "2026_09_21_055959_00001.parquet"
+            ]
+        )
+        manager.logger = Mock()
+        manager.bucket_name = "test-bucket"
+        metadata = pd.DataFrame(
+            [{"family": "assets", "table_name": "fleet_assets_reefers", "download_type": "time"}]
+        )
+
+        missing = manager.missing_dates(
+            metadata=metadata,
+            configs_for_update={},
+            start_date=datetime(2026, 9, 21),
+            end_date=datetime(2026, 9, 22),
+        )
+
+        self.assertEqual(dict(missing), {})
 
 
 class LogCleanupTests(unittest.TestCase):

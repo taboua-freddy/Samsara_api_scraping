@@ -5,7 +5,7 @@ import re
 import tempfile
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 import pandas as pd
@@ -291,7 +291,12 @@ def date_to_iso_or_timestamp(
     if date_type == "date":
         return date.date().isoformat()
     if date_type == "timestamp_ms":
-        return timestamp_to_timestamp_ms(date.timestamp())
+        utc_date = date.astimezone(timezone.utc)
+        elapsed = utc_date - datetime(1970, 1, 1, tzinfo=timezone.utc)
+        return (
+            (elapsed.days * 86400 + elapsed.seconds) * 1000
+            + elapsed.microseconds // 1000
+        )
 
 
 def process_params(params: dict | str) -> dict:

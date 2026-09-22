@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import pandas as pd
+import requests
 
 from modules.processing import (
     DataFetcher,
@@ -110,6 +111,134 @@ class StreamingExtractionTests(unittest.TestCase):
             )
         )
         return fetcher, client, gcs_client
+
+    def test_subday_intervals_have_distinct_file_names(self):
+        fetcher, _, _ = self.make_fetcher()
+
+        self.assertEqual(
+            fetcher._date_str(
+                "2026-09-21T00:00:00+00:00", "2026-09-21T05:59:59+00:00"
+            ),
+            "2026_09_21_000000_to_2026_09_21_055959",
+        )
+        self.assertEqual(
+            fetcher._date_str(
+                "2026-09-21T06:00:00+00:00", "2026-09-21T11:59:59+00:00"
+            ),
+            "2026_09_21_060000_to_2026_09_21_115959",
+        )
+        self.assertEqual(
+            fetcher._date_str(
+                "2026-09-21T00:00:00+00:00", "2026-09-21T23:59:59+00:00"
+            ),
+            "2026_09_21",
+        )
+        self.assertEqual(
+            fetcher._date_str(
+                "2026-09-21T00:00:00+00:00", "2026-09-21T23:59:59.999000+00:00"
+            ),
+            "2026_09_21",
+        )
+        self.assertEqual(
+            fetcher._date_str("2026-09-21", "2026-09-21"),
+            "2026_09_21",
+        )
+        self.assertEqual(
+            fetcher._date_str(
+                "2026-09-21T00:00:00+00:00", "2026-09-22T00:00:00+00:00"
+            ),
+            "2026_09_21",
+        )
+
+    def test_reefer_day_is_covered_by_four_contiguous_six_hour_windows(self):
+        fetcher, client, _ = self.make_fetcher()
+        client.shared_vars_manager = None
+        fetcher.max_workers = 4
+        fetcher.endpoint_info.update(
+            {
+                "family": "assets",
+                "table_name": "fleet_assets_reefers",
+                "endpoint": "v1/fleet/assets/reefers",
+                "params": "startMs=1789948800000,endMs=1790035200000",
+                "is_exception": False,
+                "exception_config": {},
+                "delta_days": 0.25,
+                "rate_limit_per_seconde": 5,
+            }
+        )
+
+        with patch("modules.processing.parallelize_execution") as run_parallel:
+            fetcher.fetch_and_upload()
+
+        windows = run_parallel.call_args.kwargs["tasks"]
+        self.assertEqual(len(windows), 4)
+        self.assertEqual(windows[0]["startMs"], 1789948800000)
+        self.assertEqual(windows[-1]["endMs"], 1790035199999)
+        for previous, following in zip(windows, windows[1:], strict=False):
+            self.assertEqual(previous["endMs"] + 1, following["startMs"])
+
+    def test_504_splits_uncommitted_reefer_window_without_overlap(self):
+        fetcher, _, _ = self.make_fetcher()
+        fetcher.endpoint_info.update(
+            {
+                "table_name": "fleet_assets_reefers",
+                "endpoint": "v1/fleet/assets/reefers",
+                "folder_path": "assets/fleet_assets_reefers",
+                "split_on_gateway_timeout": True,
+                "rate_limit_per_seconde": 5,
+            }
+        )
+        http_error = requests.HTTPError("504", response=Mock(status_code=504))
+        failure = RuntimeError("Échec après 5 tentatives")
+        failure.__cause__ = http_error
+        fetcher._stream_and_upload = Mock(side_effect=[failure, None, None])
+        start_ms = 1789948800000
+        end_ms = 1789970399999
+
+        fetcher._fetch_data_for_interval(
+            params={"startMs": start_ms, "endMs": end_ms},
+            startMs=start_ms,
+            endMs=end_ms,
+        )
+
+        calls = fetcher._stream_and_upload.call_args_list
+        self.assertEqual(len(calls), 3)
+        first_child = calls[1].kwargs["params"]
+        second_child = calls[2].kwargs["params"]
+        self.assertEqual(first_child["startMs"], start_ms)
+        self.assertEqual(first_child["endMs"] + 1, second_child["startMs"])
+        self.assertEqual(second_child["endMs"], end_ms)
+        self.assertNotEqual(calls[1].kwargs["file_name"], calls[2].kwargs["file_name"])
+
+    def test_504_keeps_committed_chunks_on_original_cursor(self):
+        fetcher, _, gcs_client = self.make_fetcher()
+        fetcher.endpoint_info.update(
+            {
+                "table_name": "fleet_assets_reefers",
+                "endpoint": "v1/fleet/assets/reefers",
+                "folder_path": "assets/fleet_assets_reefers",
+                "split_on_gateway_timeout": True,
+                "rate_limit_per_seconde": 5,
+            }
+        )
+        gcs_client.get_extraction_manifest.return_value = {
+            "state-key": {"uploaded_files": ["already-committed.parquet"]}
+        }
+        http_error = requests.HTTPError("504", response=Mock(status_code=504))
+        failure = RuntimeError("Échec après 5 tentatives")
+        failure.__cause__ = http_error
+        fetcher._stream_and_upload = Mock(side_effect=failure)
+
+        with patch("modules.processing.hashlib.sha256") as sha:
+            sha.return_value.hexdigest.return_value = "state-key"
+            with self.assertRaisesRegex(RuntimeError, "Échec après 5 tentatives"):
+                fetcher._fetch_data_for_interval(
+                    params={"startMs": 1789948800000, "endMs": 1789970399000},
+                    startMs=1789948800000,
+                    endMs=1789970399000,
+                )
+
+        fetcher._stream_and_upload.assert_called_once()
 
     def test_writes_bounded_chunks_and_marks_interval_complete(self):
         fetcher, client, gcs_client = self.make_fetcher()

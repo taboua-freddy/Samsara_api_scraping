@@ -2,11 +2,12 @@ import ast
 import hashlib
 import json
 import os.path
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Literal
 
 import pyarrow.parquet as pq
 import pytz
+import requests
 
 from .gcp import GCSClient
 from .samsara import SamsaraClient
@@ -85,6 +86,18 @@ def _read_dependency_values(
     # dict preserves the source order and avoids pandas/Arrow type coercion
     # while combining chunks with heterogeneous schemas.
     return list(dict.fromkeys(values))
+
+
+def _is_gateway_timeout(error: Exception) -> bool:
+    """Recognize a 504 even when the API client wraps the HTTP error."""
+    while error is not None:
+        response = getattr(error, "response", None)
+        if isinstance(error, requests.HTTPError) and getattr(
+            response, "status_code", None
+        ) == 504:
+            return True
+        error = error.__cause__
+    return False
 
 
 class DataFetcher:
@@ -273,8 +286,6 @@ class DataFetcher:
             # on peut le modifier dans les paramètres de l'endpoint et cette valeur qui fait fois si elle existe
             if pd.isnull(delta_days := self.endpoint_info.get("delta_days")):
                 delta_days = 1
-            else:
-                self.samsara_client.delta_days = delta_days
             delta = timedelta(days=delta_days)
 
             # cette variable uniformise la gestion des dates (startMs, startTime, startDate) en proposant un format standard qui gere les différents cas
@@ -345,8 +356,13 @@ class DataFetcher:
                 has_range = current_date < end_date
                 while has_range and current_date < end_date:
                     day_start = current_date  # .isoformat()
+                    boundary_gap = (
+                        timedelta(seconds=1)
+                        if start_end_type == "date"
+                        else timedelta(milliseconds=1)
+                    )
                     if (
-                        end_date_temp := current_date + delta - timedelta(seconds=1)
+                        end_date_temp := current_date + delta - boundary_gap
                     ) > end_date:
                         day_end = end_date  # .isoformat()
                         has_range = False
@@ -461,22 +477,83 @@ class DataFetcher:
                 )
 
         except Exception as e:
+            if self._split_gateway_timeout_interval(e, params, file_name, kwargs):
+                return
             self.logger.error(
                 f"Erreur lors de la récupération pour table : {self.endpoint_info.get('table_name')}, date : {date_str}, params : {params} exception : {e}"
             )
             raise
 
-    def _date_str(self, start_time: str, end_time: str):
-        if self.samsara_client.delta_days == 1:
-            date_str = start_time[:10].replace("-", "_")
-        else:
-            date_str = (
-                start_time[:10].replace("-", "_")
-                + "_to_"
-                + end_time[:10].replace("-", "_")
-            )
+    def _split_gateway_timeout_interval(
+        self, error: Exception, params: dict, file_name: str, kwargs: dict
+    ) -> bool:
+        """Retry a timed-out legacy query as two non-overlapping time windows."""
+        split_enabled = self.endpoint_info.get("split_on_gateway_timeout")
+        if not pd.notna(split_enabled) or not split_enabled or not _is_gateway_timeout(error):
+            return False
+        depth = int(kwargs.get("_split_depth", 0))
+        start_ms = int(params["startMs"])
+        end_ms = int(params["endMs"])
+        duration_ms = end_ms - start_ms + 1
+        if depth >= 2 or duration_ms < 2 * 60 * 60 * 1000:
+            return False
 
-        return date_str
+        endpoint = self.endpoint_info.get("endpoint")
+        identity = f'{self.endpoint_info.get("folder_path")}/{file_name}|{endpoint}'
+        state_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        state = self.gcs_client.get_extraction_manifest().get(state_key, {})
+        if state.get("uploaded_files") or state.get("next_cursor"):
+            # A committed chunk must be resumed with its cursor to avoid duplicates.
+            return False
+
+        middle_ms = start_ms + duration_ms // 2
+        if middle_ms <= start_ms or middle_ms > end_ms:
+            return False
+        self.logger.warning(
+            f"Samsara a renvoyé 504 pour {self.endpoint_info.get('table_name')} "
+            f"[{start_ms}, {end_ms}]. Nouvelle tentative en deux fenêtres: "
+            f"[{start_ms}, {middle_ms - 1}] et [{middle_ms}, {end_ms}]."
+        )
+        base_params = kwargs["params"]
+        for child_start, child_end in (
+            (start_ms, middle_ms - 1),
+            (middle_ms, end_ms),
+        ):
+            self._fetch_data_for_interval(
+                params=base_params,
+                startMs=child_start,
+                endMs=child_end,
+                _split_depth=depth + 1,
+            )
+        return True
+
+    def _date_str(self, start_time: str, end_time: str):
+        start = datetime.fromisoformat(start_time)
+        end = datetime.fromisoformat(end_time)
+        start_date = start.strftime("%Y_%m_%d")
+        end_date = end.strftime("%Y_%m_%d")
+
+        if len(start_time) == 10 and len(end_time) == 10:
+            return start_date if start_date == end_date else f"{start_date}_to_{end_date}"
+
+        if (
+            end - start == timedelta(days=1)
+            and start.time() == time.min
+            and end.time() == time.min
+        ):
+            return start_date
+        if (
+            start.date() == end.date()
+            and start.time() == time.min
+            and end.time() >= time(23, 59, 59)
+        ):
+            return start_date
+        if end - start < timedelta(days=1):
+            return (
+                f"{start_date}_{start.strftime('%H%M%S')}_to_"
+                f"{end_date}_{end.strftime('%H%M%S')}"
+            )
+        return f"{start_date}_to_{end_date}"
 
     def _download_flatten_and_upload_dynamic_url(
         self, endpoint: str, params: dict, date_str: str, index: int, **kwargs

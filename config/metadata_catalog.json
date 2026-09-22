@@ -251,7 +251,8 @@
     "description": "Assets frigorifiques et les statistiques spécifiques aux assets frigorifiques.",
     "is_exception": 0,
     "exception_config": {},
-    "delta_days": 1.0,
+    "delta_days": 0.25,
+    "split_on_gateway_timeout": true,
     "download_type": "time",
     "time_partitioning_field": null,
     "clustering_fields": null

@@ -118,8 +118,8 @@ class BucketManager:
         r"^(?P<family>[^/]+)/"
         r"(?P<main_family>[^/]+)/"
         r"(?P<table_name>.+?)"
-        r"(?:_(?P<start_date>\d{4}_\d{2}_\d{2}))?"
-        r"(?:_to_(?P<end_date>\d{4}_\d{2}_\d{2}))?"
+        r"(?:_(?P<start_date>\d{4}_\d{2}_\d{2})(?:_\d{6})?)?"
+        r"(?:_to_(?P<end_date>\d{4}_\d{2}_\d{2})(?:_\d{6})?)?"
         r"(?:_(?P<index>\d+))?"
         r"\.parquet$"
     )
@@ -378,6 +378,9 @@ class BucketManager:
                     else:
                         _start_date = date_range[0]
                         _end_date = date_range[1]
+                        if _start_date == _end_date:
+                            current_dates[table_name].append(_start_date)
+                            continue
                         current_dates[table_name].extend(
                             [
                                 _start_date + timedelta(days=i)

@@ -89,3 +89,10 @@ class MetadataValidationTests(unittest.TestCase):
         alerts_config = by_name.loc["alerts_incidents", "exception_config"]
         self.assertEqual(alerts_config["table_column_name"], "id")
         self.assertIn("configurationId", alerts_config["table_column_aliases"])
+
+    def test_reefer_endpoint_uses_short_windows_and_504_fallback(self):
+        frame = metadata_module.make_meta_data("21/09/2026", "22/09/2026")
+        reefer = frame.set_index("table_name").loc["fleet_assets_reefers"]
+
+        self.assertEqual(reefer["delta_days"], 0.25)
+        self.assertIs(reefer["split_on_gateway_timeout"], True)
