@@ -1,10 +1,14 @@
 import threading
 import json
+import io
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from google.api_core.exceptions import Conflict
 from google.cloud import bigquery
 from google.resumable_media.common import InvalidResponse
@@ -14,13 +18,42 @@ from modules.gcp import (
     BucketManager,
     ExecutionLock,
     GCSClient,
+    GCSBigQueryLoader,
     build_load_fingerprint,
+    current_oneshot_files,
 )
 from modules.extraction_manifest import partition_key, request_signature
 from modules.interface import SearchRetrieveType
 
 
 class BigQueryManagerTests(unittest.TestCase):
+    def test_oneshot_batch_uses_single_truncate_job(self):
+        load_job = Mock(errors=None)
+        load_job.result.return_value = load_job
+        client = Mock(project="project")
+        client.load_table_from_uri.return_value = load_job
+        manager = BigQueryManager.__new__(BigQueryManager)
+        manager.bigquery_client = client
+        manager.dataset_id = "dataset"
+        manager.logger = Mock()
+        manager.memory_manager = Mock()
+        manager.memory_manager.read.return_value = pd.DataFrame([{
+            "table_name": "fleet_tags",
+            "download_type": "oneshot",
+            "time_partitioning_field": None,
+            "clustering_fields": None,
+        }])
+        uris = ["gs://bucket/part1.parquet", "gs://bucket/part2.parquet"]
+
+        manager.load_parquet_to_bigquery(uris, "fleet_tags")
+
+        call = client.load_table_from_uri.call_args
+        self.assertEqual(call.args[0], uris)
+        self.assertEqual(
+            call.kwargs["job_config"].write_disposition,
+            bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+
     def test_waits_for_load_job_completion(self):
         load_job = Mock(errors=None)
         load_job.result.return_value = load_job
@@ -69,6 +102,19 @@ class BigQueryManagerTests(unittest.TestCase):
 
 
 class LoadManifestTests(unittest.TestCase):
+    def test_oneshot_snapshot_selection_keeps_previous_complete_during_retry(self):
+        previous = {"status": "complete", "uploaded_files": ["old.parquet"]}
+        self.assertEqual(
+            current_oneshot_files({
+                "snapshot": {
+                    "status": "in_progress",
+                    "previous_complete": previous,
+                    "uploaded_files": ["partial.parquet"],
+                }
+            }),
+            ["old.parquet"],
+        )
+
     def test_time_file_fingerprint_ignores_generation(self):
         first = build_load_fingerprint("bucket", "path/file.parquet", "1", "time")
         second = build_load_fingerprint("bucket", "path/file.parquet", "2", "time")
@@ -173,6 +219,148 @@ class LoadManifestTests(unittest.TestCase):
             report["reasons"],
             {"orphan": 1, "checkpointed": 1, "obsolete_oneshot": 1},
         )
+
+    def test_cleanup_keeps_only_latest_oneshot_snapshot_across_different_uris(self):
+        client = GCSClient.__new__(GCSClient)
+        client.bucket_manager = Mock(bucket_name="test-bucket")
+        client.bucket_manager.file_exists.return_value = (True, Mock())
+        client.get_bigquery_load_manifest = Mock(return_value={
+            "old": {
+                "uri": "gs://test-bucket/old.parquet",
+                "table_name": "fleet_tags_vehicles",
+                "source_table_name": "fleet_tags",
+                "loaded_at": "2026-09-22T00:00:00",
+            },
+            "new": {
+                "uri": "gs://test-bucket/new1.parquet",
+                "uris": ["gs://test-bucket/new1.parquet", "gs://test-bucket/new2.parquet"],
+                "table_name": "fleet_tags_vehicles",
+                "source_table_name": "fleet_tags",
+                "loaded_at": "2026-09-23T00:00:00",
+            },
+        })
+
+        report = client.cleanup_bigquery_load_manifest(
+            configs_for_update={"fleet_tags": {"download_type": "oneshot"}},
+            dry_run=True,
+        )
+
+        self.assertEqual(report["kept"], 1)
+        self.assertEqual(report["reasons"]["obsolete_oneshot"], 1)
+
+
+class OneshotLoadTests(unittest.TestCase):
+    def test_normalizes_optional_columns_across_oneshot_chunks(self):
+        paths = ["assets/fleet_tags/first.parquet", "assets/fleet_tags/second.parquet"]
+        objects = {}
+        for path, table in zip(paths, [
+            pa.table({"id": [1], "first_only": ["a"]}),
+            pa.table({"id": [2], "second_only": ["b"]}),
+        ]):
+            buffer = io.BytesIO()
+            pq.write_table(table, buffer)
+            objects[path] = buffer.getvalue()
+
+        def download(path):
+            blob = Mock()
+            blob.download_to_filename.side_effect = (
+                lambda filename: Path(filename).write_bytes(objects[path])
+            )
+            return blob
+
+        target = BucketManager.__new__(BucketManager)
+        target.bucket = Mock()
+        target.bucket.blob.side_effect = download
+        target.upload_bytes = Mock(side_effect=(
+            lambda buffer, path: objects.__setitem__(path, buffer.getvalue())
+        ))
+        client = GCSClient.__new__(GCSClient)
+        client.target_bucket_manager = target
+
+        client._normalize_oneshot_parquet_schemas(paths)
+
+        first, second = [pq.read_table(io.BytesIO(objects[path])) for path in paths]
+        self.assertEqual(first.schema.names, second.schema.names)
+        self.assertEqual(first.schema.names, ["id", "first_only", "second_only"])
+        self.assertEqual(first["second_only"].to_pylist(), [None])
+        self.assertEqual(second["first_only"].to_pylist(), [None])
+
+    def test_transform_reads_only_latest_completed_snapshot(self):
+        prefix = "assets/fleet_tags/"
+        old = f"{prefix}fleet_tags_2026_09_22_100000_1111111100001.parquet"
+        current = f"{prefix}fleet_tags_2026_09_23_100000_2222222200001.parquet"
+        raw_client = GCSClient.__new__(GCSClient)
+        raw_client.bucket_manager = Mock()
+        raw_client.bucket_manager.list_parquet_files.return_value = [old, current]
+        raw_client.bucket_manager.get_start_date.return_value = None
+        raw_client.bucket_manager.get_end_date.return_value = None
+        raw_client.get_extraction_manifest = Mock(return_value={
+            "latest": {"status": "complete", "uploaded_files": [current]}
+        })
+        with (
+            patch.object(BucketManager, "__init__", return_value=None),
+            patch("modules.gcp.parallelize_execution", return_value=[]) as parallel,
+        ):
+            report = raw_client.transform_and_save_data(
+                "flat-bucket",
+                pd.DataFrame([{
+                    "family": "assets", "table_name": "fleet_tags",
+                    "download_type": "oneshot",
+                }]),
+                configs_for_update={},
+            )
+
+        self.assertEqual(report["selected_files"], 1)
+        self.assertEqual(parallel.call_args.kwargs["tasks"][0]["file_path"], current)
+
+    def test_loads_only_active_chunks_in_one_replace_job(self):
+        prefix = "assets/fleet_tags/"
+        names = [
+            f"{prefix}fleet_tags_vehicles_2026_09_22_100000_1111111100001.parquet",
+            f"{prefix}fleet_tags_vehicles_2026_09_23_100000_2222222200001.parquet",
+            f"{prefix}fleet_tags_vehicles_2026_09_23_100000_2222222200002.parquet",
+        ]
+        active_raw = [
+            f"{prefix}fleet_tags_2026_09_23_100000_2222222200001.parquet",
+            f"{prefix}fleet_tags_2026_09_23_100000_2222222200002.parquet",
+        ]
+        loader = GCSBigQueryLoader.__new__(GCSBigQueryLoader)
+        loader.bucket_name = "flat-bucket"
+        loader.bucket_manager = Mock()
+        loader.bucket_manager.list_parquet_file_metadata.return_value = [
+            {"name": name, "generation": str(index + 1)}
+            for index, name in enumerate(names)
+        ]
+        loader.bucket_manager.get_table_name.return_value = "fleet_tags_vehicles"
+        loader.gcs_client = Mock()
+        loader.gcs_client.get_bigquery_load_manifest.return_value = {}
+        loader.raw_gcs_client = Mock()
+        loader.raw_gcs_client.get_extraction_manifest.return_value = {
+            "latest": {"status": "complete", "uploaded_files": active_raw}
+        }
+        loader.bigquery_manager = Mock()
+        loader.bigquery_manager.load_parquet_to_bigquery.side_effect = (
+            lambda uri, table_name, job_id: (uri, Mock())
+        )
+        loader.logger = Mock()
+        loader._from = None
+        loader._to = None
+        loader.max_workers = 1
+
+        loader.run(
+            configs_for_update={},
+            metadata=pd.DataFrame([{
+                "family": "assets",
+                "table_name": "fleet_tags",
+                "download_type": "oneshot",
+            }]),
+        )
+
+        loader.bigquery_manager.load_parquet_to_bigquery.assert_called_once()
+        uris = loader.bigquery_manager.load_parquet_to_bigquery.call_args.kwargs["uri"]
+        self.assertEqual(uris, [f"gs://flat-bucket/{name}" for name in names[1:]])
+        manifest_entry = next(iter(loader.gcs_client.update_bigquery_load_manifest.call_args.args[0].values()))
+        self.assertEqual(manifest_entry["uris"], uris)
 
 
 class ExtractionManifestStorageTests(unittest.TestCase):

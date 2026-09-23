@@ -113,6 +113,7 @@ Par exemple, pour cette seule table, ajouter `"window_minutes": 180` dans l'obje
 | `--lookback-days N` | Fenêtre de `N` jours se terminant aujourd'hui (`N ≥ 1`) ; incompatible avec `--start_date` et `--end_date`. |
 | `--table NOM` | Table précise ; répétable. Prioritaire sur les autres sélections de tables. |
 | `--table_file_path ALL` ou chemin Excel | `ALL` prend les 51 tables du catalogue ; sinon la première colonne du fichier Excel est lue. Ignoré si `--table` est fourni. |
+| `--default-tables` | Sélectionne explicitement toutes les tables renvoyées par `get_table_name_by_category()` (`ev`, `time`, `stats`, `core`), sans inclure les autres tables du catalogue. Incompatible avec `--table`, `--table_file_path` et `--table_cat`. |
 | `--table_cat CATEGORIE` | Groupe `ev`, `time`, `stats` ou `core`, si aucune sélection plus prioritaire. Sans catégorie reconnue, la liste par défaut est utilisée. Sert aussi de version dans le chemin des logs GCS. |
 | `--max_workers N` | Concurrence des appels de téléchargement (`N ≥ 1`). Sans valeur : comportement automatique du pool Python. N'augmente pas la limite API autorisée. |
 | `--stages ...` | Choisir parmi `download transform load` ; les trois étapes sont exécutées par défaut. Permet par exemple `--stages transform load` sans retélécharger. |
@@ -122,7 +123,10 @@ Exemple de contrôle avant exécution :
 
 ```powershell
 python .\main.py --start_date 18/09/2026 --end_date 19/09/2026 --table fleet_assets_reefers --stages download transform load --dry-run
+python .\main.py --lookback-days 1 --default-tables --dry-run
 ```
+
+Pour les tables `oneshot`, `download` démarre un nouvel instantané si le précédent est complet ; il reprend un téléchargement partiel sinon. Le manifeste par table référence les chunks de l'instantané terminé. Les étapes suivantes ignorent les anciennes versions présentes dans GCS. La transformation harmonise les schémas Parquet des chunks d'une même table par union des colonnes, puis le chargement utilise un seul job BigQuery `WRITE_TRUNCATE` par table. Un instantané sans fichier transformé arrête le chargement au lieu de conserver silencieusement une ancienne version. Les anciens fichiers GCS restent stockés : prévoir une politique de rétention si nécessaire.
 
 ## Déploiement et maintenance
 
@@ -142,6 +146,8 @@ Dans `cloudbuild.yaml`, les substitutions suivantes sont modifiables :
 `${PROJECT_ID}` et `${COMMIT_SHA}` sont fournis par Cloud Build ; le secret lui-même n'est pas une substitution en clair.
 
 Le même fichier fixe actuellement `--tasks=1`, `--max-retries=1`, `--task-timeout=24h`, `--cpu=8`, `--memory=16Gi`, les variables injectées par `--set-env-vars`, le jeton par `--set-secrets` et les arguments par `--args=--lookback-days=1,--table_file_path=ALL`. Son `timeout: 1800s` limite **la construction et le déploiement Cloud Build**, pas l'exécution de 24 h du Job. Modifier ces valeurs dans le dépôt ne change le Job qu'après un nouveau déploiement. Le script PowerShell de déploiement possède ses propres valeurs (`2` CPU, `4Gi`) : ce sont deux chemins de déploiement distincts.
+
+Pour que le Job Cloud Run utilise uniquement les catégories par défaut, remplacer son argument `--table_file_path=ALL` par `--default-tables` dans `cloudbuild.yaml`, puis redéployer. Le présent changement de code ne modifie pas automatiquement les arguments du Job existant.
 
 `cloudbuild.yaml` et le script PowerShell injectent actuellement `SAMSARA_CHUNK_ROWS=50000` et `SAMSARA_CHUNK_PAGES=25` au niveau du Job. Pour que les valeurs `chunk_rows`/`chunk_pages` propres aux tables prennent effet dans Cloud Run, retirer ces deux variables globales de `--set-env-vars` ou les ajuster volontairement : elles ont toujours priorité.
 

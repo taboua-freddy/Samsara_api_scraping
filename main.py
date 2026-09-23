@@ -193,6 +193,7 @@ def load_to_bigquery(
     configs_for_update: dict,
     start_date: datetime | None = None,
     end_date: datetime | None = None,
+    raw_gcs_client: GCSClient | None = None,
 ):
     shared_vars_manager = MemoryAccess()
     shared_vars_manager.write("metadata", metadata)
@@ -203,6 +204,7 @@ def load_to_bigquery(
         bucket_name=gcs_flattened_bucket_name,
         dataset_id=database_id,
         memory_manager=shared_vars_manager,
+        raw_gcs_client=raw_gcs_client,
         _from=start_date,
         _to=end_date,
     ).run(configs_for_update=configs_for_update, metadata=metadata)
@@ -366,6 +368,7 @@ def run_load_stage(
     load_to_bigquery(
         metadata=metadata,
         configs_for_update={} if historical else configs_for_update,
+        raw_gcs_client=gcs_client,
         start_date=(
             datetime.strptime(start_date, "%d/%m/%Y")
             if historical and start_date
@@ -413,6 +416,11 @@ if __name__ == "__main__":
         dest="selected_tables",
         action="append",
         help="Table précise à traiter. L'option peut être répétée.",
+    )
+    parser.add_argument(
+        "--default-tables",
+        action="store_true",
+        help="Traite toutes les tables des catégories ev, time, stats et core.",
     )
     parser.add_argument(
         "--stages",
@@ -479,8 +487,12 @@ if __name__ == "__main__":
         parser.error("en mode historical, start_date doit être antérieure à end_date")
     if args.max_workers is not None and args.max_workers < 1:
         parser.error("max_workers doit être supérieur ou égal à 1")
+    if args.default_tables and (args.selected_tables or table_file_path or table_cat):
+        parser.error("default-tables ne peut pas être combiné avec --table, --table_file_path ou --table_cat")
 
-    if args.selected_tables:
+    if args.default_tables:
+        table_names = list(dict.fromkeys(get_tables_default_table_names()))
+    elif args.selected_tables:
         table_names = list(dict.fromkeys(args.selected_tables))
     elif table_file_path == "ALL":
         table_names = make_meta_data(start_date, end_date)["table_name"].tolist()

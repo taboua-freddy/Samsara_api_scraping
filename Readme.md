@@ -86,9 +86,12 @@ Après validation du plan, retirer `--dry-run`. L'option `--table` peut être r�
 - `--end_date` : Date de fin (format `jj/mm/aaaa`).
 - `--max_workers` : Nombre de requêtes à traiter en parallèle.
 - `--table_file_path` : Chemin du fichier contenant les noms des tables à traiter. Utiliser `ALL` pour toutes les tables. Vous pouvez avoir la liste des tables prises en charge dans le fichier `modules/metadata.py`.
+- `--default-tables` : Traite explicitement l'union des catégories `ev`, `time`, `stats` et `core` de `get_table_name_by_category()` ; cette sélection est plus restreinte que `--table_file_path ALL` et ne se combine pas avec les autres sélections de tables.
 - `--table` : Nom exact d'une table à traiter ; répétable.
 - `--stages` : Sous-ensemble ordonné de `download`, `transform` et `load`.
 - `--dry-run` : Validation locale du plan sans appel externe ni écriture cloud.
+
+Une table `oneshot` est un instantané rafraîchi à chaque nouvelle étape `download` après une extraction complète. Un téléchargement interrompu peut reprendre son instantané en cours. Les nouveaux chunks portent un identifiant de version ; `transform` et `load` ne prennent que les fichiers du dernier instantané terminé. Avant le chargement, les schémas Parquet des chunks sont harmonisés par union des colonnes (les valeurs absentes deviennent nulles), puis les chunks d'une même table sont chargés ensemble en remplacement dans BigQuery. Les anciens objets GCS ne sont pas supprimés automatiquement.
 
 ## Architecture du Code
 - `main.py` : Script principal pour l'orchestration de la collecte et du chargement des données.

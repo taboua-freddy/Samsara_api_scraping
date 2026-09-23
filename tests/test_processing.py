@@ -446,3 +446,64 @@ class StreamingExtractionTests(unittest.TestCase):
         fetcher._stream_and_upload("endpoint", {}, "example", "", 5)
 
         client.iter_data_pages.assert_not_called()
+
+    def test_completed_oneshot_is_refreshed_without_reusing_old_chunks(self):
+        fetcher, client, gcs_client = self.make_fetcher()
+        fetcher.endpoint_info["download_type"] = "oneshot"
+        identity = "vehicle_stats/example/example|endpoint"
+        old_key = hashlib.sha256(identity.encode()).hexdigest()
+        old_file = "vehicle_stats/example/example_00001.parquet"
+        gcs_client.get_extraction_manifest.return_value = {
+            old_key: {
+                "identity": identity,
+                "status": "complete",
+                "uploaded_files": [old_file],
+            }
+        }
+        client.iter_data_pages.return_value = iter(
+            [([{"id": 1}, {"id": 2}, {"id": 3}], {"hasNextPage": True, "endCursor": "next"}),
+             ([{"id": 4}], {"hasNextPage": False})]
+        )
+
+        fetcher._stream_and_upload("endpoint", {}, "example", "", 5)
+
+        self.assertNotIn("after", client.iter_data_pages.call_args.kwargs["params"])
+        states = [call.args[2] for call in gcs_client.update_extraction_state.call_args_list]
+        self.assertEqual(states[0]["status"], "in_progress")
+        self.assertEqual(states[0]["previous_complete"]["uploaded_files"], [old_file])
+        self.assertEqual(states[-1]["status"], "complete")
+        self.assertNotIn(old_file, states[-1]["uploaded_files"])
+        self.assertEqual(len(states[-1]["uploaded_files"]), 2)
+        self.assertEqual(len({path.split("_")[-1] for path in states[-1]["uploaded_files"]}), 2)
+        self.assertIn("snapshot_id", states[-1])
+
+    def test_partial_oneshot_resumes_same_snapshot(self):
+        fetcher, client, gcs_client = self.make_fetcher()
+        fetcher.endpoint_info["download_type"] = "oneshot"
+        identity = "vehicle_stats/example/example|endpoint"
+        key = hashlib.sha256(identity.encode()).hexdigest()
+        gcs_client.get_extraction_manifest.return_value = {
+            key: {
+                "identity": identity,
+                "status": "in_progress",
+                "snapshot_id": "2026_09_23_154512_12345678",
+                "next_cursor": "cursor",
+                "next_chunk_index": 2,
+                "uploaded_files": [
+                    "vehicle_stats/example/example_2026_09_23_154512_1234567800001.parquet"
+                ],
+                "rows_written": 3,
+            }
+        }
+        client.iter_data_pages.return_value = iter(
+            [([{"id": 4}], {"hasNextPage": False})]
+        )
+
+        fetcher._stream_and_upload("endpoint", {}, "example", "", 5)
+
+        self.assertEqual(client.iter_data_pages.call_args.kwargs["params"]["after"], "cursor")
+        self.assertEqual(
+            fetcher._flatten_and_upload.call_args.args[1],
+            "example_2026_09_23_154512_1234567800002",
+        )
+        self.assertEqual(gcs_client.update_extraction_state.call_args.args[2]["rows_written"], 4)

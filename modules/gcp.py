@@ -14,6 +14,7 @@ from io import BytesIO
 from typing import Callable
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 from google.api_core.exceptions import Conflict, PreconditionFailed
 from google.cloud import bigquery, storage
@@ -50,6 +51,24 @@ def build_load_fingerprint(
     if download_type == DownloadType.ONESHOT.value:
         identity = f"{identity}#{generation or 'unknown'}"
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def current_oneshot_files(manifest: dict) -> list[str] | None:
+    """Return the latest published snapshot, or None for pre-manifest data.
+
+    An in-progress refresh must not expose its partial files to later stages.
+    """
+    states = [
+        state for state in manifest.values()
+        if isinstance(state, dict) and state.get("status") in ("complete", "in_progress")
+    ]
+    if not states:
+        return None
+    latest = max(states, key=lambda state: state.get("updated_at") or "")
+    if latest["status"] != "complete":
+        previous = latest.get("previous_complete") or {}
+        return list(previous.get("uploaded_files") or [])
+    return list(latest.get("uploaded_files") or [])
 
 
 def _is_generation_conflict(exc: Exception) -> bool:
@@ -520,9 +539,9 @@ class BigQueryManager:
         self.partition_expiration_ms = int(timedelta(days=self.partition_expiration_days).total_seconds() * 1000)
 
     def load_parquet_to_bigquery(
-            self, uri: str, table_name: str, job_id: str | None = None
-    ) -> tuple[str, bigquery.LoadJob] | tuple[str, Exception]:
-        """Charger un fichier Parquet de GCS vers BigQuery."""
+            self, uri: str | list[str], table_name: str, job_id: str | None = None
+    ) -> tuple[str | list[str], bigquery.LoadJob] | tuple[str | list[str], Exception]:
+        """Charger un ou plusieurs fichiers Parquet de GCS vers BigQuery."""
         table_id = f"{self.bigquery_client.project}.{self.dataset_id}.{table_name}"
 
         # Supprimer la table si elle existe déjà
@@ -968,7 +987,7 @@ class GCSClient:
             nonlocal report
             reasons = {"orphan": [], "checkpointed": [], "obsolete_oneshot": []}
             keep = {}
-            oneshot_by_uri = defaultdict(list)
+            oneshot_by_table = defaultdict(list)
 
             for fingerprint, entry in manifest.items():
                 if not isinstance(entry, dict):
@@ -979,18 +998,29 @@ class GCSClient:
                 if not uri.startswith(prefix):
                     keep[fingerprint] = entry
                     continue
-                blob_name = uri[len(prefix):]
-                if blob_name not in existence_cache:
-                    existence_cache[blob_name] = self.bucket_manager.file_exists(blob_name)[0]
-                if not existence_cache[blob_name]:
+                uris = entry.get("uris") or [uri]
+                blob_names = [
+                    item[len(prefix):] for item in uris if item.startswith(prefix)
+                ]
+                if len(blob_names) != len(uris):
+                    keep[fingerprint] = entry
+                    continue
+                for blob_name in blob_names:
+                    if blob_name not in existence_cache:
+                        existence_cache[blob_name] = self.bucket_manager.file_exists(blob_name)[0]
+                if not all(existence_cache[name] for name in blob_names):
                     reasons["orphan"].append(fingerprint)
                     continue
+
+                blob_name = blob_names[0]
 
                 source_table = entry.get("source_table_name") or entry.get("table_name")
                 config = configs_for_update.get(source_table, {})
                 download_type = config.get("download_type", DownloadType.TIME.value)
                 if download_type == DownloadType.ONESHOT.value:
-                    oneshot_by_uri[uri].append((fingerprint, entry))
+                    oneshot_by_table[(source_table, entry.get("table_name"))].append(
+                        (fingerprint, entry)
+                    )
                     continue
 
                 loaded_at = self._parse_manifest_datetime(entry.get("loaded_at"))
@@ -1010,7 +1040,7 @@ class GCSClient:
                     continue
                 keep[fingerprint] = entry
 
-            for uri_entries in oneshot_by_uri.values():
+            for uri_entries in oneshot_by_table.values():
                 ordered = sorted(
                     uri_entries,
                     key=lambda item: self._parse_manifest_datetime(
@@ -1113,6 +1143,15 @@ class GCSClient:
             input_folder = family + "/" + table_name
             files = self.bucket_manager.list_parquet_files(input_folder=input_folder)
 
+            download_type = row.get("download_type", DownloadType.TIME.value)
+            if download_type == DownloadType.ONESHOT.value:
+                active_files = current_oneshot_files(
+                    self.get_extraction_manifest(table_name)
+                )
+                if active_files is not None:
+                    active_paths = set(active_files)
+                    files = [path for path in files if path in active_paths]
+
             self.bucket_manager.logger.info(
                 f"Found {len(files)} files for table {table_name} in bucket {self.bucket_manager.bucket_name}"
             )
@@ -1123,7 +1162,6 @@ class GCSClient:
                 "folder_path": input_folder,
             }
 
-            download_type = row.get("download_type", DownloadType.TIME.value)
             last_transform_date = configs_for_update.get(MAPPING_TABLES.get(table_name, table_name), {}).get(ColumnToUpdate.TRANSFORMATION.value, None)
             for file_path in files:
                 file_start = self.bucket_manager.get_start_date(file_path)
@@ -1131,9 +1169,9 @@ class GCSClient:
                 # Keep files that overlap the requested half-open interval.
                 # Timestamp endpoints may start on the previous UTC calendar
                 # day when the CLI dates were interpreted in local time.
-                if start_date and file_end and file_end < start_date:
+                if download_type != DownloadType.ONESHOT.value and start_date and file_end and file_end < start_date:
                     continue
-                if end_date and file_start and file_start >= end_date:
+                if download_type != DownloadType.ONESHOT.value and end_date and file_start and file_start >= end_date:
                     continue
                 if download_type == DownloadType.TIME.value and last_transform_date:
                     if file_start and file_start < datetime.strptime(last_transform_date, "%d/%m/%Y"):
@@ -1152,6 +1190,19 @@ class GCSClient:
             func=self._apply_transformations_and_save,
             logger=self.bucket_manager.logger,
         )
+        oneshot_tables = {
+            row["table_name"] for _, row in metadata.iterrows()
+            if row.get("download_type") == DownloadType.ONESHOT.value
+        }
+        output_groups = defaultdict(list)
+        for result in results:
+            if not isinstance(result, dict) or result.get("source_table_name") not in oneshot_tables:
+                continue
+            for path in result.get("output_files", []):
+                output_groups[self.target_bucket_manager.get_table_name(path)].append(path)
+        for output_table, paths in output_groups.items():
+            if output_table and len(paths) > 1:
+                self._normalize_oneshot_parquet_schemas(paths)
         report = {
             "selected_files": len(tasks),
             "uploaded_files": sum(
@@ -1168,14 +1219,51 @@ class GCSClient:
         self.bucket_manager.logger.info(f"Bilan de transformation: {report}")
         return report
 
+    def _normalize_oneshot_parquet_schemas(self, paths: list[str]) -> None:
+        """Give every chunk the union schema before a BigQuery replace load."""
+        schemas = []
+        for path in paths:
+            with CustomNamedTemporaryFile(dir=TMP_DIR) as temp_file:
+                self.target_bucket_manager.bucket.blob(path).download_to_filename(
+                    temp_file.name
+                )
+                schemas.append(pq.ParquetFile(temp_file.name).schema_arrow)
+        try:
+            union_schema = pa.unify_schemas(schemas, promote_options="permissive")
+        except pa.ArrowInvalid as exc:
+            raise RuntimeError(
+                f"Schémas Parquet incompatibles pour {paths[0]}: {exc}"
+            ) from exc
+
+        for path, schema in zip(paths, schemas):
+            if schema.equals(union_schema, check_metadata=False):
+                continue
+            with CustomNamedTemporaryFile(dir=TMP_DIR) as temp_file:
+                self.target_bucket_manager.bucket.blob(path).download_to_filename(
+                    temp_file.name
+                )
+                table = pq.read_table(temp_file.name)
+                arrays = [
+                    table[field.name].cast(field.type)
+                    if field.name in table.column_names
+                    else pa.nulls(table.num_rows, type=field.type)
+                    for field in union_schema
+                ]
+                normalized = pa.Table.from_arrays(arrays, schema=union_schema)
+                buffer = BytesIO()
+                pq.write_table(normalized, buffer)
+                buffer.seek(0)
+                self.target_bucket_manager.upload_bytes(buffer, path)
+
     def _apply_transformations_and_save(
             self,
             file_path: str,
             endpoint_info: dict,
             skip_existing: bool = False,
-    ) -> dict[str, int]:
+    ) -> dict[str, int | str | list[str]]:
         uploaded_files = 0
         skipped_files = 0
+        output_files = []
         with CustomNamedTemporaryFile(dir=TMP_DIR) as temp_input:
             # Télécharger le fichier Parquet dans un fichier temporaire
             blob = self.bucket_manager.bucket.blob(file_path)
@@ -1208,13 +1296,17 @@ class GCSClient:
                             f"[skip] Fichier transformé déjà présent: {destination_blob_name}"
                         )
                         skipped_files += 1
+                        output_files.append(destination_blob_name)
                         continue
                     buffer = parquet_buffer(table_df)
                     self.target_bucket_manager.upload_bytes(buffer, destination_blob_name)
                     uploaded_files += 1
+                    output_files.append(destination_blob_name)
         return {
             "uploaded_files": uploaded_files,
             "skipped_files": skipped_files,
+            "output_files": output_files,
+            "source_table_name": endpoint_info.get("table_name"),
         }
 
 
@@ -1232,6 +1324,7 @@ class GCSBigQueryLoader:
         self._to: datetime | None = kwargs.get("_to", None)
         self.max_workers = 1
         self.memory_manager: MemoryAccess | None = kwargs.get("memory_manager")
+        self.raw_gcs_client: GCSClient | None = kwargs.get("raw_gcs_client")
 
     def run(
             self, configs_for_update: dict, metadata: pd.DataFrame | None = None
@@ -1252,6 +1345,69 @@ class GCSBigQueryLoader:
                     continue
                 input_folder = f"{family}/{configured_table_name}"
                 files = self.bucket_manager.list_parquet_file_metadata(input_folder=input_folder)
+                download_type = row.get("download_type", DownloadType.TIME.value)
+                if download_type == DownloadType.ONESHOT.value:
+                    if self.raw_gcs_client is None:
+                        raise RuntimeError("Le client GCS brut est requis pour charger les instantanés oneshot")
+                    active_raw_files = current_oneshot_files(
+                        self.raw_gcs_client.get_extraction_manifest(configured_table_name)
+                    )
+                    if active_raw_files is not None:
+                        active_suffixes = {
+                            extract_suffixe(path.rsplit("/", 1)[-1])
+                            for path in active_raw_files
+                        }
+                        files = [
+                            item for item in files
+                            if extract_suffixe(item["name"].rsplit("/", 1)[-1])
+                            in active_suffixes
+                        ]
+                    grouped_files = defaultdict(list)
+                    for item in files:
+                        table_name = self.bucket_manager.get_table_name(item["name"])
+                        if table_name:
+                            grouped_files[table_name].append(item)
+                    if active_raw_files is not None and not grouped_files:
+                        raise RuntimeError(
+                            f"Aucun fichier transformé pour l'instantané oneshot "
+                            f"{configured_table_name}; chargement interrompu pour éviter "
+                            "de conserver silencieusement l'ancienne version."
+                        )
+                    for table_name, group in grouped_files.items():
+                        group.sort(key=lambda item: item["name"])
+                        uris = [f"gs://{self.bucket_name}/{item['name']}" for item in group]
+                        identity = [
+                            self.bucket_name,
+                            table_name,
+                            [
+                                [item["name"], str(item.get("generation") or "")]
+                                for item in group
+                            ],
+                        ]
+                        fingerprint = hashlib.sha256(
+                            json.dumps(identity, separators=(",", ":")).encode("utf-8")
+                        ).hexdigest()
+                        if fingerprint in manifest:
+                            self.logger.info(f"[skip] Instantané déjà chargé: {table_name}")
+                            continue
+                        future = executor.submit(
+                            self.bigquery_manager.load_parquet_to_bigquery,
+                            uri=uris,
+                            table_name=table_name,
+                            job_id=f"samsara_load_{fingerprint}",
+                        )
+                        futures.append(future)
+                        future_entries[future] = {
+                            "fingerprint": fingerprint,
+                            "entry": {
+                                "uri": uris[0],
+                                "uris": uris,
+                                "table_name": table_name,
+                                "source_table_name": configured_table_name,
+                                "loaded_at": datetime.now().isoformat(),
+                            },
+                        }
+                    continue
                 files.reverse()  # priviégier le schema des fichiers les plus récents
                 # Grouper les fichiers par table (en fonction du chemin)
                 for file_metadata in files:

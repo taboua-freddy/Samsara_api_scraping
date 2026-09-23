@@ -2,7 +2,8 @@ import ast
 import hashlib
 import json
 import os.path
-from datetime import datetime, time, timedelta
+import uuid
+from datetime import datetime, time, timedelta, timezone
 from typing import Literal
 
 import pyarrow.parquet as pq
@@ -10,6 +11,7 @@ import pytz
 import requests
 
 from .gcp import GCSClient
+from .interface import DownloadType
 from .extraction_manifest import (
     partition_key,
     plan_timestamp_intervals,
@@ -679,6 +681,7 @@ class DataFetcher:
         )
         manifest = self.gcs_client.get_extraction_manifest(table_name)
         state = manifest.get(state_key, {})
+        is_oneshot = self.endpoint_info.get("download_type") == DownloadType.ONESHOT.value
         if not (start_ms is not None and end_exclusive_ms is not None) and not state:
             legacy_key = hashlib.sha256(state_identity.encode()).hexdigest()
             legacy_state = manifest.get(legacy_key, {})
@@ -694,16 +697,45 @@ class DataFetcher:
                 {"start_ms": start_ms, "end_exclusive_ms": end_exclusive_ms}
             )
         uploaded_files = state.get("uploaded_files", [])
-        files_are_present = all(
+        previous_complete = (
+            state if state.get("status") == "complete"
+            else state.get("previous_complete")
+        ) if is_oneshot else None
+        files_are_present = (
+            is_oneshot and state.get("status") == "complete"
+        ) or all(
             self.gcs_client.bucket_manager.file_exists(path)[0]
             for path in uploaded_files
         )
-        if state.get("status") == "complete" and files_are_present:
+        if not is_oneshot and state.get("status") == "complete" and files_are_present:
             self.logger.info(f"Extraction déjà complète pour {state_identity}")
             return
-        if state.get("status") == "complete" and not files_are_present:
+        if state.get("status") == "complete" or not files_are_present:
             state = {}
             uploaded_files = []
+        if is_oneshot and state and not state.get("snapshot_id"):
+            # Legacy partial files have stable names; do not mix them with a
+            # newly versioned refresh.
+            state = {}
+            uploaded_files = []
+
+        # A completed oneshot is a snapshot, not a permanent extraction
+        # checkpoint. Keep each refresh in distinct objects so a failed run
+        # cannot overwrite the last complete snapshot.
+        snapshot_id = state.get("snapshot_id") if is_oneshot else None
+        if is_oneshot and not snapshot_id:
+            snapshot_id = (
+                f"{datetime.now(timezone.utc):%Y_%m_%d_%H%M%S}_"
+                f"{uuid.uuid4().int % 100_000_000:08d}"
+            )
+        if is_oneshot:
+            state_metadata["snapshot_id"] = snapshot_id
+
+        def chunk_file_name(index: int) -> str:
+            if is_oneshot:
+                stamp, nonce = snapshot_id.rsplit("_", 1)
+                return f"{file_name}_{stamp}_{nonce}{index:05d}"
+            return f"{file_name}_{index:05d}"
 
         request_params = params.copy()
         if cursor := state.get("next_cursor"):
@@ -763,7 +795,7 @@ class DataFetcher:
             ):
                 destination = self._flatten_and_upload(
                     buffered_rows,
-                    f"{file_name}_{chunk_index:05d}",
+                    chunk_file_name(chunk_index),
                     date_str,
                 )
                 if destination:
@@ -783,6 +815,7 @@ class DataFetcher:
                             "next_chunk_index": chunk_index,
                             "rows_written": rows_written,
                             "uploaded_files": uploaded_files,
+                            **({"previous_complete": previous_complete} if previous_complete else {}),
                             "updated_at": datetime.now().isoformat(),
                         },
                     )
@@ -790,7 +823,7 @@ class DataFetcher:
         if buffered_rows:
             destination = self._flatten_and_upload(
                 buffered_rows,
-                f"{file_name}_{chunk_index:05d}",
+                chunk_file_name(chunk_index),
                 date_str,
             )
             if destination:
