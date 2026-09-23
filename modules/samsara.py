@@ -4,6 +4,7 @@ import requests
 
 from .logs import MyLogger
 from .raters import EndpointRateLimiter, MemoryAccess
+from .utils import MAX_RETRIES_REQUEST
 
 
 class SamsaraClient:
@@ -64,7 +65,7 @@ class SamsaraClient:
         url = f"{self.base_url}/{endpoint}"
         has_next_page = True
         params = (params or {}).copy()
-        max_retries = 5
+        max_retries = MAX_RETRIES_REQUEST
 
         while has_next_page:
             retry_count = 0

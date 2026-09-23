@@ -1,10 +1,12 @@
 import threading
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 import pandas as pd
 from google.api_core.exceptions import Conflict
+from google.cloud import bigquery
 from google.resumable_media.common import InvalidResponse
 
 from modules.gcp import (
@@ -14,6 +16,7 @@ from modules.gcp import (
     GCSClient,
     build_load_fingerprint,
 )
+from modules.extraction_manifest import partition_key, request_signature
 from modules.interface import SearchRetrieveType
 
 
@@ -37,6 +40,11 @@ class BigQueryManagerTests(unittest.TestCase):
         self.assertEqual(uri, "gs://bucket/file.parquet")
         self.assertIs(result, load_job)
         load_job.result.assert_called_once_with()
+        job_config = client.load_table_from_uri.call_args.kwargs["job_config"]
+        self.assertIn(
+            bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
+            job_config.schema_update_options,
+        )
 
     def test_recovers_an_existing_deterministic_job(self):
         load_job = Mock(errors=None)
@@ -167,6 +175,79 @@ class LoadManifestTests(unittest.TestCase):
         )
 
 
+class ExtractionManifestStorageTests(unittest.TestCase):
+    def test_uses_a_distinct_manifest_path_per_table(self):
+        client = GCSClient.__new__(GCSClient)
+        client._get_config = Mock(return_value={})
+        client._mutate_config = Mock()
+
+        client.get_extraction_manifest("fleet_assets_reefers")
+        client.update_extraction_state("fleet_assets_reefers", "key", {"status": "complete"})
+
+        client._get_config.assert_called_once_with(
+            "extraction_manifests/fleet_assets_reefers"
+        )
+        self.assertEqual(
+            client._mutate_config.call_args.args[0],
+            "extraction_manifests/fleet_assets_reefers",
+        )
+
+    def test_migrates_only_matching_legacy_utc_intervals(self):
+        client = GCSClient.__new__(GCSClient)
+        endpoint = "v1/fleet/assets/reefers"
+        table = "fleet_assets_reefers"
+        identity = (
+            "assets/fleet_assets_reefers/"
+            "fleet_assets_reefers_2026_09_21_000000_to_2026_09_21_055959"
+            f"|{endpoint}"
+        )
+        client._get_config = Mock(return_value={
+            "old": {
+                "identity": identity,
+                "status": "complete",
+                "uploaded_files": ["existing.parquet"],
+                "next_cursor": None,
+            }
+        })
+        client._mutate_config = Mock()
+        client.bucket_manager = Mock()
+        client.bucket_manager.file_exists.return_value = (True, Mock())
+
+        client.migrate_legacy_extraction_state(
+            table, endpoint, {"startMs": 0, "endMs": 1}
+        )
+
+        name, mutator = client._mutate_config.call_args.args
+        updated = mutator({})
+        signature = request_signature(table, endpoint, {"startMs": 0, "endMs": 1})
+        imported = [value for value in updated.values() if value.get("status") == "complete"]
+        self.assertEqual(name, "extraction_manifests/fleet_assets_reefers")
+        self.assertEqual(len(imported), 1)
+        self.assertEqual(imported[0]["signature"], signature)
+        self.assertEqual(
+            partition_key(signature, imported[0]["start_ms"], imported[0]["end_exclusive_ms"]),
+            next(key for key, value in updated.items() if value is imported[0]),
+        )
+
+    def test_imports_legacy_keys_by_table_without_deleting_global_manifest(self):
+        client = GCSClient.__new__(GCSClient)
+        client.bucket_manager = Mock()
+        client._get_config = Mock(side_effect=[{}, {
+            "first": {"identity": "assets/reefers/reefers_2026_09_21|endpoint"},
+            "other": {"identity": "assets/other/other_2026_09_21|endpoint"},
+        }])
+        client._mutate_config = Mock()
+
+        client.migrate_legacy_table_state("reefers")
+
+        name, mutator = client._mutate_config.call_args.args
+        result = mutator({})
+        self.assertEqual(name, "extraction_manifests/reefers")
+        self.assertIn("first", result)
+        self.assertNotIn("other", result)
+        self.assertTrue(result["__meta__"]["legacy_table_imported"])
+
+
 class ChunkPathTests(unittest.TestCase):
     def test_chunk_path_preserves_table_date_and_index(self):
         manager = BucketManager.__new__(BucketManager)
@@ -226,6 +307,45 @@ class ChunkPathTests(unittest.TestCase):
         )
 
         self.assertEqual(dict(missing), {})
+
+    def test_manifest_does_not_count_partial_day_as_complete(self):
+        manager = BucketManager.__new__(BucketManager)
+        manager.logger = Mock()
+        manager.bucket_name = "test-bucket"
+        manager.gcs_config_path = "resources/configs"
+        manager.list_parquet_files = Mock()
+        manager.file_exists = Mock(return_value=(True, Mock()))
+        table = "fleet_assets_reefers"
+        endpoint = "v1/fleet/assets/reefers"
+        signature = request_signature(table, endpoint, {"startMs": 1, "endMs": 86_400_001})
+        manifest = {
+            "first-window": {
+                "signature": signature,
+                "start_ms": 1,
+                "end_exclusive_ms": 21_600_001,
+                "status": "complete",
+                "uploaded_files": ["first.parquet"],
+            }
+        }
+        blob = Mock()
+        blob.exists.return_value = True
+        blob.download_as_bytes.return_value = json.dumps(manifest).encode()
+        manager.bucket = Mock()
+        manager.bucket.blob.return_value = blob
+        metadata = pd.DataFrame([{
+            "family": "assets", "table_name": table, "endpoint": endpoint,
+            "params": "startMs=1,endMs=86400001", "download_type": "time",
+        }])
+
+        missing = manager.missing_dates(
+            metadata=metadata,
+            configs_for_update={},
+            start_date=datetime(2026, 9, 21),
+            end_date=datetime(2026, 9, 22),
+        )
+
+        self.assertEqual(missing[table], [datetime(2026, 9, 21)])
+        manager.list_parquet_files.assert_not_called()
 
 
 class LogCleanupTests(unittest.TestCase):

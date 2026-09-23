@@ -1,4 +1,5 @@
 import os
+import hashlib
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -11,6 +12,7 @@ from modules.processing import (
     _parse_exception_config,
     _read_dependency_values,
 )
+from modules.extraction_manifest import partition_key, request_signature
 
 
 class ExceptionConfigTests(unittest.TestCase):
@@ -93,6 +95,7 @@ class StreamingExtractionTests(unittest.TestCase):
         client = Mock()
         bucket_manager = Mock()
         bucket_manager.file_exists.return_value = (True, Mock())
+        bucket_manager.bucket.list_blobs.return_value = []
         gcs_client = Mock(bucket_manager=bucket_manager)
         gcs_client.get_extraction_manifest.return_value = manifest or {}
         fetcher = DataFetcher.__new__(DataFetcher)
@@ -177,6 +180,52 @@ class StreamingExtractionTests(unittest.TestCase):
         for previous, following in zip(windows, windows[1:], strict=False):
             self.assertEqual(previous["endMs"] + 1, following["startMs"])
 
+    def test_changed_window_resumes_original_partial_partition(self):
+        fetcher, client, gcs_client = self.make_fetcher()
+        client.shared_vars_manager = None
+        fetcher.max_workers = 1
+        endpoint = "v1/fleet/assets/reefers"
+        start_ms = 1789948800000
+        end_ms = start_ms + 12 * 3_600_000
+        fetcher.endpoint_info.update({
+            "family": "assets", "table_name": "fleet_assets_reefers",
+            "endpoint": endpoint,
+            "params": f"startMs={start_ms},endMs={end_ms}",
+            "is_exception": False, "exception_config": {},
+            "delta_days": 0.25, "rate_limit_per_seconde": 5,
+        })
+        signature = request_signature(
+            "fleet_assets_reefers", endpoint, {"startMs": start_ms, "endMs": end_ms}
+        )
+        gcs_client.get_extraction_manifest.return_value = {
+            "complete": {
+                "signature": signature, "start_ms": start_ms,
+                "end_exclusive_ms": start_ms + 6 * 3_600_000,
+                "status": "complete", "uploaded_files": ["existing.parquet"],
+            },
+            "partial": {
+                "signature": signature,
+                "start_ms": start_ms + 6 * 3_600_000,
+                "end_exclusive_ms": start_ms + 9 * 3_600_000,
+                "status": "in_progress", "next_cursor": "confirmed",
+                "uploaded_files": ["partial.parquet"],
+            },
+        }
+
+        with (
+            patch.dict(os.environ, {"SAMSARA_WINDOW_MINUTES": "60"}),
+            patch("modules.processing.parallelize_execution") as run_parallel,
+        ):
+            fetcher.fetch_and_upload()
+
+        windows = run_parallel.call_args.kwargs["tasks"]
+        self.assertEqual(windows[0], {
+            "startMs": start_ms + 6 * 3_600_000,
+            "endMs": start_ms + 9 * 3_600_000 - 1,
+        })
+        self.assertEqual(len(windows), 4)
+        self.assertEqual(windows[-1]["endMs"], end_ms - 1)
+
     def test_504_splits_uncommitted_reefer_window_without_overlap(self):
         fetcher, _, _ = self.make_fetcher()
         fetcher.endpoint_info.update(
@@ -184,7 +233,7 @@ class StreamingExtractionTests(unittest.TestCase):
                 "table_name": "fleet_assets_reefers",
                 "endpoint": "v1/fleet/assets/reefers",
                 "folder_path": "assets/fleet_assets_reefers",
-                "split_on_gateway_timeout": True,
+                "split_on_server_error": True,
                 "rate_limit_per_seconde": 5,
             }
         )
@@ -210,6 +259,77 @@ class StreamingExtractionTests(unittest.TestCase):
         self.assertEqual(second_child["endMs"], end_ms)
         self.assertNotEqual(calls[1].kwargs["file_name"], calls[2].kwargs["file_name"])
 
+    def test_500_after_504_splits_again_and_covers_original_window(self):
+        fetcher, _, _ = self.make_fetcher()
+        fetcher.endpoint_info.update(
+            {
+                "table_name": "fleet_assets_reefers",
+                "endpoint": "v1/fleet/assets/reefers",
+                "folder_path": "assets/fleet_assets_reefers",
+                "split_on_server_error": True,
+                "rate_limit_per_seconde": 5,
+            }
+        )
+
+        def failure(status):
+            error = RuntimeError("Échec après 5 tentatives")
+            error.__cause__ = requests.HTTPError(
+                str(status), response=Mock(status_code=status)
+            )
+            return error
+
+        fetcher._stream_and_upload = Mock(
+            side_effect=[failure(504), failure(500), None, None, None]
+        )
+        start_ms = 1789704000000
+        end_ms = 1789725599999
+
+        fetcher._fetch_data_for_interval(
+            params={"startMs": start_ms, "endMs": end_ms},
+            startMs=start_ms,
+            endMs=end_ms,
+        )
+
+        calls = fetcher._stream_and_upload.call_args_list
+        self.assertEqual(len(calls), 5)
+        grandchildren = [calls[2].kwargs["params"], calls[3].kwargs["params"]]
+        first_child = calls[1].kwargs["params"]
+        second_child = calls[4].kwargs["params"]
+        self.assertEqual(grandchildren[0]["startMs"], start_ms)
+        self.assertEqual(
+            grandchildren[0]["endMs"] + 1, grandchildren[1]["startMs"]
+        )
+        self.assertEqual(grandchildren[1]["endMs"], first_child["endMs"])
+        self.assertEqual(first_child["endMs"] + 1, second_child["startMs"])
+        self.assertEqual(second_child["endMs"], end_ms)
+
+    def test_persistent_500_stops_at_the_bounded_split_depth(self):
+        fetcher, _, _ = self.make_fetcher()
+        fetcher.endpoint_info.update(
+            {
+                "table_name": "fleet_assets_reefers",
+                "endpoint": "v1/fleet/assets/reefers",
+                "folder_path": "assets/fleet_assets_reefers",
+                "split_on_server_error": True,
+                "rate_limit_per_seconde": 5,
+            }
+        )
+        error = RuntimeError("Échec après 5 tentatives")
+        error.__cause__ = requests.HTTPError(
+            "500", response=Mock(status_code=500)
+        )
+        fetcher._stream_and_upload = Mock(side_effect=error)
+
+        with self.assertRaisesRegex(RuntimeError, "Échec après 5 tentatives"):
+            fetcher._fetch_data_for_interval(
+                params={"startMs": 1789704000000, "endMs": 1789706699999},
+                startMs=1789704000000,
+                endMs=1789706699999,
+                _split_depth=3,
+            )
+
+        fetcher._stream_and_upload.assert_called_once()
+
     def test_504_keeps_committed_chunks_on_original_cursor(self):
         fetcher, _, gcs_client = self.make_fetcher()
         fetcher.endpoint_info.update(
@@ -217,26 +337,29 @@ class StreamingExtractionTests(unittest.TestCase):
                 "table_name": "fleet_assets_reefers",
                 "endpoint": "v1/fleet/assets/reefers",
                 "folder_path": "assets/fleet_assets_reefers",
-                "split_on_gateway_timeout": True,
+                "split_on_server_error": True,
                 "rate_limit_per_seconde": 5,
             }
         )
+        signature = request_signature(
+            "fleet_assets_reefers", "v1/fleet/assets/reefers",
+            {"startMs": 1789948800000, "endMs": 1789970399000},
+        )
+        key = partition_key(signature, 1789948800000, 1789970399001)
         gcs_client.get_extraction_manifest.return_value = {
-            "state-key": {"uploaded_files": ["already-committed.parquet"]}
+            key: {"uploaded_files": ["already-committed.parquet"]}
         }
         http_error = requests.HTTPError("504", response=Mock(status_code=504))
         failure = RuntimeError("Échec après 5 tentatives")
         failure.__cause__ = http_error
         fetcher._stream_and_upload = Mock(side_effect=failure)
 
-        with patch("modules.processing.hashlib.sha256") as sha:
-            sha.return_value.hexdigest.return_value = "state-key"
-            with self.assertRaisesRegex(RuntimeError, "Échec après 5 tentatives"):
-                fetcher._fetch_data_for_interval(
-                    params={"startMs": 1789948800000, "endMs": 1789970399000},
-                    startMs=1789948800000,
-                    endMs=1789970399000,
-                )
+        with self.assertRaisesRegex(RuntimeError, "Échec après 5 tentatives"):
+            fetcher._fetch_data_for_interval(
+                params={"startMs": 1789948800000, "endMs": 1789970399000},
+                startMs=1789948800000,
+                endMs=1789970399000,
+            )
 
         fetcher._stream_and_upload.assert_called_once()
 
@@ -258,10 +381,14 @@ class StreamingExtractionTests(unittest.TestCase):
         self.assertEqual(len(first_call.args[0]), 4)
         self.assertEqual(first_call.args[1], "example_2026_09_18_00001")
         self.assertEqual(len(second_call.args[0]), 1)
-        final_state = gcs_client.update_extraction_state.call_args_list[-1].args[1]
+        final_state = gcs_client.update_extraction_state.call_args_list[-1].args[2]
         self.assertEqual(final_state["status"], "complete")
         self.assertEqual(final_state["rows_written"], 5)
         self.assertEqual(final_state["next_chunk_index"], 3)
+        self.assertEqual(
+            final_state["chunk_policy"], {"chunk_rows": 3, "chunk_pages": 25}
+        )
+        self.assertEqual(final_state["chunk_policy_history"][0]["from_chunk_index"], 1)
 
     def test_resumes_from_last_confirmed_cursor(self):
         state = {
@@ -270,17 +397,25 @@ class StreamingExtractionTests(unittest.TestCase):
             "next_chunk_index": 2,
             "rows_written": 3,
             "uploaded_files": ["vehicle_stats/example/example_2026_09_18_00001.parquet"],
+            "chunk_policy_history": [{
+                "chunk_rows": 2,
+                "chunk_pages": 10,
+                "from_chunk_index": 1,
+                "recorded_at": "2026-09-18T00:00:00",
+            }],
         }
         fetcher, client, gcs_client = self.make_fetcher()
-        gcs_client.get_extraction_manifest.return_value = {"state-key": state}
+        signature = request_signature("example", "endpoint", {})
+        key = hashlib.sha256(
+            f"{signature}:vehicle_stats/example/example_2026_09_18|endpoint".encode()
+        ).hexdigest()
+        gcs_client.get_extraction_manifest.return_value = {key: state}
         client.iter_data_pages.return_value = iter(
             [([{"id": 4}], {"hasNextPage": False})]
         )
-        with patch("modules.processing.hashlib.sha256") as sha:
-            sha.return_value.hexdigest.return_value = "state-key"
-            fetcher._stream_and_upload(
-                "endpoint", {}, "example_2026_09_18", "date", 5
-            )
+        fetcher._stream_and_upload(
+            "endpoint", {}, "example_2026_09_18", "date", 5
+        )
 
         request_params = client.iter_data_pages.call_args.kwargs["params"]
         self.assertEqual(request_params["after"], "confirmed-cursor")
@@ -288,3 +423,26 @@ class StreamingExtractionTests(unittest.TestCase):
             fetcher._flatten_and_upload.call_args.args[1],
             "example_2026_09_18_00002",
         )
+        final_state = gcs_client.update_extraction_state.call_args.args[2]
+        self.assertEqual(final_state["next_chunk_index"], 3)
+        self.assertEqual(len(final_state["chunk_policy_history"]), 2)
+        self.assertEqual(final_state["chunk_policy_history"][1]["from_chunk_index"], 2)
+        self.assertEqual(
+            final_state["chunk_policy_history"][1]["chunk_rows"], 3
+        )
+
+    def test_non_temporal_endpoint_uses_imported_legacy_state(self):
+        fetcher, client, gcs_client = self.make_fetcher()
+        identity = "vehicle_stats/example/example|endpoint"
+        old_key = hashlib.sha256(identity.encode()).hexdigest()
+        gcs_client.get_extraction_manifest.return_value = {
+            old_key: {
+                "identity": identity,
+                "status": "complete",
+                "uploaded_files": ["vehicle_stats/example/example_00001.parquet"],
+            }
+        }
+
+        fetcher._stream_and_upload("endpoint", {}, "example", "", 5)
+
+        client.iter_data_pages.assert_not_called()

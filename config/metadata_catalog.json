@@ -252,7 +252,9 @@
     "is_exception": 0,
     "exception_config": {},
     "delta_days": 0.25,
-    "split_on_gateway_timeout": true,
+    "split_on_server_error": true,
+    "split_min_minutes": 45,
+    "split_max_depth": 3,
     "download_type": "time",
     "time_partitioning_field": null,
     "clustering_fields": null

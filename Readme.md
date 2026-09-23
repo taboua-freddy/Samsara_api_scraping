@@ -35,6 +35,8 @@ Ce projet vise à collecter des données depuis l'API Samsara, les stocker sur G
    ```
 
 ## Configuration
+La référence complète des variables d'environnement, des champs du catalogue, des options de lancement et du déploiement est dans [docs/configuration.md](docs/configuration.md). `.env.example` fournit les valeurs de départ sans secret.
+
 ### Variables d'environnement
 Créer un fichier `.env` à la racine du projet et y ajouter les informations suivantes :
 ```ini
@@ -54,6 +56,20 @@ Le script **main.py** peut être exécuté avec les paramètres suivants :
 ```bash
 python main.py --start_date "01/01/2024" --end_date "10/01/2024" --table_file_path tables.xlsx --max_workers 5
 ```
+
+Pour retraiter une période historique sans lire ni modifier les curseurs
+incrémentaux, utiliser `--historical`. La date de fin est exclusive :
+
+```bash
+python main.py --historical --start_date "18/09/2026" --end_date "20/09/2026" \
+  --table fleet_assets_reefers
+```
+
+Le mode historique exige les deux dates. Les manifestes d'extraction et de
+chargement restent actifs afin de reprendre une exécution interrompue et
+d'éviter les doublons. Les fichiers transformés déjà présents ne sont pas
+réécrits dans ce mode, ce qui conserve leur génération GCS et empêche un
+nouveau chargement `WRITE_APPEND` des mêmes données.
 
 Prévisualiser une intégration ciblée sans connexion à Samsara ou Google Cloud :
 ```bash
@@ -97,6 +113,14 @@ ruff check main.py modules scripts tests
 Les erreurs d'extraction, d'upload, de transformation ou de chargement BigQuery interrompent désormais l'exécution. Les checkpoints ne sont mis à jour qu'après la réussite complète de l'étape correspondante.
 
 Les chargements BigQuery utilisent également un manifeste stocké dans le bucket aplati (`resources/configs/bigquery_load_manifest.json`) et des identifiants de jobs déterministes. Une relance peut ainsi reprendre un job existant sans ajouter une seconde fois les mêmes fichiers temporels. Les mises à jour des fichiers de configuration utilisent les générations GCS afin de détecter les écritures concurrentes.
+
+### Reprise de l'extraction et découpage temporel
+
+Chaque table possède désormais son propre manifeste d'extraction dans le bucket brut : `resources/configs/extraction_manifests/<table>.json`. Pour les endpoints `startMs`/`endMs`, il enregistre les bornes UTC exactes (fin exclusive), les fichiers confirmés, le curseur et les éventuelles sous-fenêtres créées après une erreur serveur. Une relance ne planifie que les plages non couvertes ; une fenêtre partiellement téléchargée reprend avec ses bornes et son curseur d'origine. Une fenêtre terminée sans donnée compte aussi comme couverte. La présence d'un seul fichier de quelques heures ne valide plus la journée entière.
+
+La fenêtre initiale provient de `delta_days` dans le catalogue et peut être remplacée pour une exécution avec `SAMSARA_WINDOW_MINUTES`. Les limites du split sont `SAMSARA_SPLIT_MIN_MINUTES` (45 par défaut) et `SAMSARA_SPLIT_MAX_DEPTH` (3 par défaut) ; les valeurs propres à une table peuvent aussi être définies par `window_minutes`, `split_min_minutes` et `split_max_depth` dans le catalogue. Modifier ces paramètres ne remet pas en cause les plages déjà terminées. Les valeurs effectives sont conservées dans chaque état du manifeste pour audit. Le manifeste global précédent reste intact ; seuls ses anciens intervalles UTC vérifiables sont importés lors de la première exécution de la table.
+
+Les seuils de chunk (`SAMSARA_CHUNK_ROWS` et `SAMSARA_CHUNK_PAGES`, ou `chunk_rows` et `chunk_pages` par table dans le catalogue) peuvent aussi changer à la relance. Le manifeste conserve l'historique des seuils à partir de l'index du prochain chunk : les fichiers déjà confirmés ne sont pas réécrits et la reprise continue avec le curseur et l'index enregistrés. Ces seuils ne font pas partie de l'identité temporelle de la partition. Ce sont des limites en nombre de lignes ou de pages, pas une taille exacte en octets du Parquet.
 
 ### Nettoyage du manifeste BigQuery
 

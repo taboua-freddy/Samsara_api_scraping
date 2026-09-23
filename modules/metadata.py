@@ -146,6 +146,7 @@ def build_metadata(
     table_names: list[str],
     start_date: str | None = None,
     end_date: str | None = None,
+    use_configured_start: bool = True,
 ) -> pd.DataFrame:
     if start_date is None:
         start_date = DEFAULT_START_DATE
@@ -157,7 +158,7 @@ def build_metadata(
         if table_configs := configs_for_update.get(table_name, {}):
             if table_configs.get("download_type") == DownloadType.TIME.value:
                 last_update_time = table_configs.get(ColumnToUpdate.DOWNLOAD.value, None)
-                if last_update_time is not None:
+                if use_configured_start and last_update_time is not None:
                     table_start_date = last_update_time
         end_point = make_meta_data(start_time=table_start_date, end_time=end_date).query(
             "table_name == @table_name"

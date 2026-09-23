@@ -35,6 +35,7 @@ from .utils import (
     pandas_to_bq_schema,
     parallelize_execution,
     parquet_buffer,
+    process_params,
 )
 
 
@@ -349,6 +350,8 @@ class BucketManager:
         # Grouper les fichiers par table (en fonction du chemin)
         current_dates = defaultdict(list)
         missing_dates = defaultdict(list)
+        manifest_tables = set()
+        requested_start_date = start_date
 
         for _, row in metadata.iterrows():
             table_name = row.get("table_name")
@@ -360,6 +363,63 @@ class BucketManager:
             input_folder = f"{family}/{table_name}"
             if not pd.isnull(row.get("download_type", None)) and row.get("download_type") == DownloadType.ONESHOT.value:
                 continue
+
+            # For timestamp endpoints a Parquet file may represent only a few
+            # hours. The per-table manifest, not its filename, proves coverage.
+            raw_params = row.get("params")
+            params = process_params(
+                raw_params if isinstance(raw_params, (str, dict)) else {}
+            )
+            if "startMs" in params and "endMs" in params:
+                manifest_blob = self.bucket.blob(
+                    f"{self.gcs_config_path}/extraction_manifests/{table_name}.json"
+                )
+                if manifest_blob.exists():
+                    from .extraction_manifest import (
+                        has_complete_coverage,
+                        request_signature,
+                    )
+
+                    manifest_tables.add(table_name)
+                    manifest = json.loads(manifest_blob.download_as_bytes())
+                    signature = request_signature(
+                        table_name, row.get("endpoint"), params
+                    )
+                    base_ms = int(params["startMs"])
+                    request_end_ms = int(params["endMs"])
+                    total_days = (end_date - requested_start_date).days
+                    local_base_ms = round(requested_start_date.timestamp() * 1000)
+                    file_presence = {}
+
+                    def exists(path: str) -> bool:
+                        if path not in file_presence:
+                            file_presence[path] = self.file_exists(path)[0]
+                        return file_presence[path]
+
+                    for day_index in range(total_days):
+                        day = requested_start_date + timedelta(days=day_index)
+                        next_day = day + timedelta(days=1)
+                        day_start_ms = base_ms + round(day.timestamp() * 1000) - local_base_ms
+                        day_end_ms = min(
+                            base_ms + round(next_day.timestamp() * 1000) - local_base_ms,
+                            request_end_ms,
+                        )
+                        if day_start_ms >= day_end_ms:
+                            continue
+                        covered = has_complete_coverage(
+                            day_start_ms,
+                            day_end_ms,
+                            manifest,
+                            signature,
+                            exists,
+                        )
+                        if covered:
+                            current_dates[table_name].append(
+                                requested_start_date + timedelta(days=day_index)
+                            )
+                    # Include tables with no complete day in the missing check.
+                    current_dates[table_name]
+                    continue
 
             files = self.list_parquet_files(input_folder=input_folder)
             if not files:
@@ -404,8 +464,11 @@ class BucketManager:
                     else start_date
                 )
             # Récupération des dates où il n'y a pas de données depuis le fichier de configuration
-            dates_with_no_data = [datetime.strptime(date, "%d/%m/%Y") for date in
-                                  config_for_update_.get(ColumnToUpdate.DATE_NO_DATA.value, [])]
+            dates_with_no_data = (
+                [] if table_name in manifest_tables else
+                [datetime.strptime(date, "%d/%m/%Y") for date in
+                 config_for_update_.get(ColumnToUpdate.DATE_NO_DATA.value, [])]
+            )
             dates_ = list(set(dates + dates_with_no_data))
             # Calculer les dates manquantes entre start_date et end_date
             for date in [
@@ -778,16 +841,114 @@ class GCSClient:
         if entries:
             self._update_config(entries, "bigquery_load_manifest")
 
-    def get_extraction_manifest(self) -> dict:
-        return self._get_config("extraction_manifest")
+    @staticmethod
+    def _extraction_manifest_name(table_name: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
+            raise ValueError(f"Nom de table invalide pour le manifeste: {table_name}")
+        return f"extraction_manifests/{table_name}"
 
-    def update_extraction_state(self, state_key: str, state: dict) -> None:
+    def get_extraction_manifest(self, table_name: str) -> dict:
+        return self._get_config(self._extraction_manifest_name(table_name))
+
+    def update_extraction_state(
+        self, table_name: str, state_key: str, state: dict
+    ) -> None:
         def replace_state(current: dict) -> dict:
             updated = current.copy()
             updated[state_key] = state
             return updated
 
-        self._mutate_config("extraction_manifest", replace_state)
+        self._mutate_config(self._extraction_manifest_name(table_name), replace_state)
+
+    def migrate_legacy_table_state(self, table_name: str) -> None:
+        """Copy a table's legacy keys once, preserving non-temporal resumes."""
+        filename = self._extraction_manifest_name(table_name)
+        current = self._get_config(filename)
+        if current.get("__meta__", {}).get("legacy_table_imported"):
+            return
+        legacy = self._get_config("extraction_manifest")
+        imports = {}
+        for key, state in legacy.items():
+            if not isinstance(state, dict):
+                continue
+            identity = state.get("identity", "")
+            file_path = identity.partition("|")[0]
+            folder = file_path.rsplit("/", 1)[0].rsplit("/", 1)[-1]
+            if folder == table_name:
+                imports[key] = state
+
+        def merge(existing: dict) -> dict:
+            result = existing.copy()
+            for key, state in imports.items():
+                result.setdefault(key, state)
+            meta = result.get("__meta__", {}).copy()
+            meta["version"] = 2
+            meta["legacy_table_imported"] = True
+            result["__meta__"] = meta
+            return result
+
+        self._mutate_config(filename, merge)
+        self.bucket_manager.logger.info(
+            f"Manifeste de {table_name}: {len(imports)} ancien(s) état(s) importé(s)."
+        )
+
+    def migrate_legacy_extraction_state(
+        self, table_name: str, endpoint: str, params: dict
+    ) -> None:
+        """Import provable UTC windows once; never delete the legacy manifest."""
+        from .extraction_manifest import (
+            legacy_utc_bounds,
+            partition_key,
+            request_signature,
+        )
+
+        # The old key did not encode static request parameters. Such entries
+        # cannot safely be attributed to a new request with extra filters.
+        if set(params) - {"startMs", "endMs", "after", "endpoints"}:
+            return
+        signature = request_signature(table_name, endpoint, params)
+        filename = self._extraction_manifest_name(table_name)
+        current = self._get_config(filename)
+        if signature in current.get("__meta__", {}).get("legacy_signatures", []):
+            return
+        legacy = current
+        imports = {}
+        for state in legacy.values():
+            if not isinstance(state, dict):
+                continue
+            identity = state.get("identity", "")
+            if not identity.endswith(f"|{endpoint}"):
+                continue
+            bounds = legacy_utc_bounds(table_name, identity)
+            if bounds is None or state.get("status") not in {"complete", "in_progress"}:
+                continue
+            files = state.get("uploaded_files", [])
+            if not all(self.bucket_manager.file_exists(path)[0] for path in files):
+                continue
+            key = partition_key(signature, *bounds)
+            imports[key] = {
+                **state,
+                "signature": signature,
+                "start_ms": bounds[0],
+                "end_exclusive_ms": bounds[1],
+                "migrated_from_legacy": True,
+            }
+
+        def merge(existing: dict) -> dict:
+            result = existing.copy()
+            for key, state in imports.items():
+                result.setdefault(key, state)
+            meta = result.get("__meta__", {}).copy()
+            meta["version"] = 2
+            signatures = meta.get("legacy_signatures", [])
+            meta["legacy_signatures"] = list(dict.fromkeys([*signatures, signature]))
+            result["__meta__"] = meta
+            return result
+
+        self._mutate_config(filename, merge)
+        self.bucket_manager.logger.info(
+            f"Manifeste de {table_name}: {len(imports)} partition(s) UTC migrée(s)."
+        )
 
     def cleanup_bigquery_load_manifest(
         self,
@@ -921,7 +1082,15 @@ class GCSClient:
         # Enregistre les configurations mises à jour dans le bucket GCS.
         self._update_config(data, "configs_for_update", erase=False)
 
-    def transform_and_save_data(self, target_bucket_name: str, metadata: pd.DataFrame, configs_for_update: dict) -> None:
+    def transform_and_save_data(
+            self,
+            target_bucket_name: str,
+            metadata: pd.DataFrame,
+            configs_for_update: dict,
+            start_date: datetime | None = None,
+            end_date: datetime | None = None,
+            skip_existing: bool = False,
+    ) -> dict[str, int]:
         """
         Transforme les données et les télécharge dans un bucket GCS.
 
@@ -957,28 +1126,56 @@ class GCSClient:
             download_type = row.get("download_type", DownloadType.TIME.value)
             last_transform_date = configs_for_update.get(MAPPING_TABLES.get(table_name, table_name), {}).get(ColumnToUpdate.TRANSFORMATION.value, None)
             for file_path in files:
+                file_start = self.bucket_manager.get_start_date(file_path)
+                file_end = self.bucket_manager.get_end_date(file_path) or file_start
+                # Keep files that overlap the requested half-open interval.
+                # Timestamp endpoints may start on the previous UTC calendar
+                # day when the CLI dates were interpreted in local time.
+                if start_date and file_end and file_end < start_date:
+                    continue
+                if end_date and file_start and file_start >= end_date:
+                    continue
                 if download_type == DownloadType.TIME.value and last_transform_date:
-                    start_date = self.bucket_manager.get_start_date(file_path)
-                    if start_date and start_date < datetime.strptime(last_transform_date, "%d/%m/%Y"):
+                    if file_start and file_start < datetime.strptime(last_transform_date, "%d/%m/%Y"):
                         continue
-                    end_date = self.bucket_manager.get_end_date(file_path)
-                    if end_date and end_date < datetime.strptime(last_transform_date, "%d/%m/%Y"):
+                    if file_end and file_end < datetime.strptime(last_transform_date, "%d/%m/%Y"):
                         continue
                 tasks.append(
                     {
                         "file_path": file_path,
                         "endpoint_info": end_point_info,
+                        "skip_existing": skip_existing,
                     }
                 )
-        parallelize_execution(
+        results = parallelize_execution(
             tasks=tasks,
             func=self._apply_transformations_and_save,
             logger=self.bucket_manager.logger,
         )
+        report = {
+            "selected_files": len(tasks),
+            "uploaded_files": sum(
+                result.get("uploaded_files", 0)
+                for result in results
+                if isinstance(result, dict)
+            ),
+            "skipped_files": sum(
+                result.get("skipped_files", 0)
+                for result in results
+                if isinstance(result, dict)
+            ),
+        }
+        self.bucket_manager.logger.info(f"Bilan de transformation: {report}")
+        return report
 
     def _apply_transformations_and_save(
-            self, file_path: str, endpoint_info: dict
-    ) -> None:
+            self,
+            file_path: str,
+            endpoint_info: dict,
+            skip_existing: bool = False,
+    ) -> dict[str, int]:
+        uploaded_files = 0
+        skipped_files = 0
         with CustomNamedTemporaryFile(dir=TMP_DIR) as temp_input:
             # Télécharger le fichier Parquet dans un fichier temporaire
             blob = self.bucket_manager.bucket.blob(file_path)
@@ -1004,8 +1201,21 @@ class GCSClient:
                     file_name = f'{table}_{suffixe}' if suffixe else table
                     # table_df.to_json(f'{TMP_DIR}/{file_name}.json', orient='records', lines=False)
                     destination_blob_name = f'{endpoint_info.get("folder_path")}/{file_name}.parquet'
+                    if skip_existing and self.target_bucket_manager.file_exists(
+                        destination_blob_name
+                    )[0]:
+                        self.bucket_manager.logger.info(
+                            f"[skip] Fichier transformé déjà présent: {destination_blob_name}"
+                        )
+                        skipped_files += 1
+                        continue
                     buffer = parquet_buffer(table_df)
                     self.target_bucket_manager.upload_bytes(buffer, destination_blob_name)
+                    uploaded_files += 1
+        return {
+            "uploaded_files": uploaded_files,
+            "skipped_files": skipped_files,
+        }
 
 
 class GCSBigQueryLoader:
@@ -1048,12 +1258,12 @@ class GCSBigQueryLoader:
                     file_path = file_metadata["name"]
                     table_name = self.bucket_manager.get_table_name(file_path)
                     start_date = self.bucket_manager.get_start_date(file_path)
+                    end_date = self.bucket_manager.get_end_date(file_path) or start_date
                     if self._from:
-                        if start_date and start_date < self._from:
+                        if end_date and end_date < self._from:
                             continue
                     if self._to:
-                        end_date = self.bucket_manager.get_end_date(file_path) or start_date
-                        if end_date and end_date > self._to:
+                        if start_date and start_date >= self._to:
                             continue
                     if configs := configs_for_update.get(
                             MAPPING_TABLES.get(table_name, table_name), {}

@@ -191,6 +191,8 @@ def scrape_samsara_to_gcs(
 def load_to_bigquery(
     metadata: pd.DataFrame,
     configs_for_update: dict,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
 ):
     shared_vars_manager = MemoryAccess()
     shared_vars_manager.write("metadata", metadata)
@@ -201,7 +203,8 @@ def load_to_bigquery(
         bucket_name=gcs_flattened_bucket_name,
         dataset_id=database_id,
         memory_manager=shared_vars_manager,
-        # _to=datetime.strptime(end_date, "%d/%m/%Y")
+        _from=start_date,
+        _to=end_date,
     ).run(configs_for_update=configs_for_update, metadata=metadata)
 
 
@@ -269,6 +272,7 @@ def run_download_stage(
     start_date: str,
     end_date: str,
     max_workers: int | None,
+    historical: bool = False,
 ) -> None:
     started_at = datetime.now()
     scrape_samsara_to_gcs(metadata=metadata, iteration=0, max_workers=max_workers)
@@ -278,30 +282,31 @@ def run_download_stage(
         is_exception=True,
         max_workers=max_workers,
     )
-    download_missing_files(
-        configs_for_update=configs_for_update,
-        metadata=metadata,
-        start_date=start_date,
-        end_date=end_date,
-        max_workers=max_workers,
-    )
-    gcs_client.update_configs_for_update(
-        metadata=metadata,
-        end_time=end_date,
-        col_to_update=ColumnToUpdate.DOWNLOAD,
-    )
-    missing_dates = gcs_client.bucket_manager.missing_dates(
-        metadata=metadata,
-        configs_for_update=configs_for_update,
-        end_date=datetime.strptime(end_date, "%d/%m/%Y"),
-        start_date=datetime.strptime(start_date, "%d/%m/%Y"),
-    )
-    gcs_client.update_configs_for_update(
-        metadata=metadata,
-        end_time=end_date,
-        col_to_update=ColumnToUpdate.DATE_NO_DATA,
-        missing_dates=missing_dates,
-    )
+    if not historical:
+        download_missing_files(
+            configs_for_update=configs_for_update,
+            metadata=metadata,
+            start_date=start_date,
+            end_date=end_date,
+            max_workers=max_workers,
+        )
+        gcs_client.update_configs_for_update(
+            metadata=metadata,
+            end_time=end_date,
+            col_to_update=ColumnToUpdate.DOWNLOAD,
+        )
+        missing_dates = gcs_client.bucket_manager.missing_dates(
+            metadata=metadata,
+            configs_for_update=configs_for_update,
+            end_date=datetime.strptime(end_date, "%d/%m/%Y"),
+            start_date=datetime.strptime(start_date, "%d/%m/%Y"),
+        )
+        gcs_client.update_configs_for_update(
+            metadata=metadata,
+            end_time=end_date,
+            col_to_update=ColumnToUpdate.DATE_NO_DATA,
+            missing_dates=missing_dates,
+        )
     elapsed = (datetime.now() - started_at).total_seconds()
     standard_logger.info(f"Étape download terminée en {elapsed} secondes")
 
@@ -311,17 +316,43 @@ def run_transform_stage(
     metadata: pd.DataFrame,
     configs_for_update: dict,
     end_date: str,
+    start_date: str | None = None,
+    historical: bool = False,
 ) -> None:
-    gcs_client.transform_and_save_data(
+    report = gcs_client.transform_and_save_data(
         target_bucket_name=gcs_flattened_bucket_name,
         metadata=metadata,
-        configs_for_update=configs_for_update,
+        configs_for_update={} if historical else configs_for_update,
+        skip_existing=historical,
+        start_date=(
+            datetime.strptime(start_date, "%d/%m/%Y")
+            if historical and start_date
+            else None
+        ),
+        end_date=(
+            datetime.strptime(end_date, "%d/%m/%Y") if historical else None
+        ),
     )
-    gcs_client.update_configs_for_update(
-        metadata=metadata,
-        end_time=end_date,
-        col_to_update=ColumnToUpdate.TRANSFORMATION,
-    )
+    if historical and isinstance(report, dict):
+        selected = report.get("selected_files", 0)
+        uploaded = report.get("uploaded_files", 0)
+        skipped = report.get("skipped_files", 0)
+        print(
+            "Transformation historique: "
+            f"{selected} fichier(s) brut(s), {uploaded} fichier(s) aplati(s) créé(s), "
+            f"{skipped} déjà présent(s)."
+        )
+        if selected and not uploaded and not skipped:
+            raise RuntimeError(
+                "La transformation historique a lu des fichiers bruts mais n'a produit "
+                "aucun fichier aplati. Vérifier le schéma des données source."
+            )
+    if not historical:
+        gcs_client.update_configs_for_update(
+            metadata=metadata,
+            end_time=end_date,
+            col_to_update=ColumnToUpdate.TRANSFORMATION,
+        )
 
 
 def run_load_stage(
@@ -329,13 +360,27 @@ def run_load_stage(
     metadata: pd.DataFrame,
     configs_for_update: dict,
     end_date: str,
+    start_date: str | None = None,
+    historical: bool = False,
 ) -> None:
-    load_to_bigquery(metadata=metadata, configs_for_update=configs_for_update)
-    gcs_client.update_configs_for_update(
+    load_to_bigquery(
         metadata=metadata,
-        end_time=end_date,
-        col_to_update=ColumnToUpdate.DATABASE,
+        configs_for_update={} if historical else configs_for_update,
+        start_date=(
+            datetime.strptime(start_date, "%d/%m/%Y")
+            if historical and start_date
+            else None
+        ),
+        end_date=(
+            datetime.strptime(end_date, "%d/%m/%Y") if historical else None
+        ),
     )
+    if not historical:
+        gcs_client.update_configs_for_update(
+            metadata=metadata,
+            end_time=end_date,
+            col_to_update=ColumnToUpdate.DATABASE,
+        )
 
 
 if __name__ == "__main__":
@@ -386,6 +431,14 @@ if __name__ == "__main__":
         type=int,
         help="Fenêtre glissante se terminant aujourd'hui, adaptée aux exécutions planifiées.",
     )
+    parser.add_argument(
+        "--historical",
+        action="store_true",
+        help=(
+            "Retraite exactement la période start_date/end_date sans utiliser ni "
+            "modifier les curseurs incrémentaux. La date de fin est exclusive."
+        ),
+    )
     args = parser.parse_args()
     start_date = args.start_date
     end_date = args.end_date
@@ -400,6 +453,11 @@ if __name__ == "__main__":
         today = datetime.now()
         start_date = (today - timedelta(days=args.lookback_days)).strftime("%d/%m/%Y")
         end_date = today.strftime("%d/%m/%Y")
+
+    if args.historical and (args.start_date is None or args.end_date is None):
+        parser.error("historical exige start_date et end_date")
+    if args.historical and args.lookback_days is not None:
+        parser.error("historical ne peut pas être combiné avec lookback-days")
 
     # start_date = "26/05/2025"
     # end_date = "30/05/2025"
@@ -417,6 +475,8 @@ if __name__ == "__main__":
         parser.error("Les dates doivent respecter le format jj/mm/aaaa")
     if parsed_start_date > parsed_end_date:
         parser.error("start_date doit être antérieure ou égale à end_date")
+    if args.historical and parsed_start_date == parsed_end_date:
+        parser.error("en mode historical, start_date doit être antérieure à end_date")
     if args.max_workers is not None and args.max_workers < 1:
         parser.error("max_workers doit être supérieur ou égal à 1")
 
@@ -464,6 +524,7 @@ if __name__ == "__main__":
         table_names=table_names,
         start_date=start_date,
         end_date=end_date,
+        use_configured_start=not args.historical,
     )
     standard_logger.info("Metadata construite avec succès.")
     if metadata.empty:
@@ -484,15 +545,30 @@ if __name__ == "__main__":
             start_date,
             end_date,
             max_workers,
+            historical=args.historical,
         )
         completed_stages += 1
         print_stage_progress(completed_stages, total_stages, "download terminé")
     if "transform" in args.stages:
-        run_transform_stage(gcs_client, metadata, configs_for_update, end_date)
+        run_transform_stage(
+            gcs_client,
+            metadata,
+            configs_for_update,
+            end_date,
+            start_date=start_date,
+            historical=args.historical,
+        )
         completed_stages += 1
         print_stage_progress(completed_stages, total_stages, "transform terminé")
     if "load" in args.stages:
-        run_load_stage(gcs_client, metadata, configs_for_update, end_date)
+        run_load_stage(
+            gcs_client,
+            metadata,
+            configs_for_update,
+            end_date,
+            start_date=start_date,
+            historical=args.historical,
+        )
         completed_stages += 1
         print_stage_progress(completed_stages, total_stages, "load terminé")
 

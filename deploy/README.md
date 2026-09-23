@@ -1,5 +1,7 @@
 # Déploiement Cloud Run Job
 
+Voir aussi la [référence complète de configuration](../docs/configuration.md) pour les variables du Job, les champs du catalogue et leur ordre de priorité.
+
 Le pipeline est déployé comme un job batch avec une seule tâche. Le verrou atomique stocké dans le bucket brut empêche deux exécutions simultanées.
 
 Prérequis : Google Cloud CLI, Artifact Registry, Cloud Build, Cloud Run, Secret Manager et un compte de service disposant uniquement des droits nécessaires sur les deux buckets et le dataset BigQuery de test.

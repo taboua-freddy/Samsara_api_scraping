@@ -10,6 +10,11 @@ import pytz
 import requests
 
 from .gcp import GCSClient
+from .extraction_manifest import (
+    partition_key,
+    plan_timestamp_intervals,
+    request_signature,
+)
 from .samsara import SamsaraClient
 from .transformation import TransformData
 from .utils import (
@@ -88,16 +93,15 @@ def _read_dependency_values(
     return list(dict.fromkeys(values))
 
 
-def _is_gateway_timeout(error: Exception) -> bool:
-    """Recognize a 504 even when the API client wraps the HTTP error."""
+def _retryable_server_status(error: Exception) -> int | None:
+    """Find a retryable HTTP status in the API client's exception chain."""
     while error is not None:
         response = getattr(error, "response", None)
-        if isinstance(error, requests.HTTPError) and getattr(
-            response, "status_code", None
-        ) == 504:
-            return True
+        status = getattr(response, "status_code", None)
+        if isinstance(error, requests.HTTPError) and status in (500, 502, 503, 504):
+            return status
         error = error.__cause__
-    return False
+    return None
 
 
 class DataFetcher:
@@ -118,12 +122,43 @@ class DataFetcher:
         self.endpoint_info: dict = endpoint_info
         self.logger = self.samsara_client.logger
         self.max_workers = kwargs.get("max_workers")
-        self.chunk_rows = int(os.getenv("SAMSARA_CHUNK_ROWS", "50000"))
+        def chunk_setting(env_name: str, metadata_name: str, default: int) -> int:
+            value = os.getenv(env_name)
+            if value is None:
+                value = endpoint_info.get(metadata_name)
+            return int(default if value is None or pd.isna(value) else value)
+
+        self.chunk_rows = chunk_setting("SAMSARA_CHUNK_ROWS", "chunk_rows", 50000)
         if self.chunk_rows < 1:
             raise ValueError("SAMSARA_CHUNK_ROWS doit être supérieur ou égal à 1")
-        self.chunk_pages = int(os.getenv("SAMSARA_CHUNK_PAGES", "25"))
+        self.chunk_pages = chunk_setting("SAMSARA_CHUNK_PAGES", "chunk_pages", 25)
         if self.chunk_pages < 1:
             raise ValueError("SAMSARA_CHUNK_PAGES doit être supérieur ou égal à 1")
+
+    def _split_policy(self) -> dict:
+        """Effective policy may change between runs without changing coverage."""
+        def setting(env_name: str, metadata_name: str, default):
+            value = os.getenv(env_name)
+            if value is None:
+                value = self.endpoint_info.get(metadata_name)
+            return default if value is None or pd.isna(value) else value
+
+        delta_days = self.endpoint_info.get("delta_days")
+        default_minutes = float(1 if pd.isna(delta_days) else delta_days) * 1440
+        window_minutes = float(
+            setting("SAMSARA_WINDOW_MINUTES", "window_minutes", default_minutes)
+        )
+        min_minutes = float(
+            setting("SAMSARA_SPLIT_MIN_MINUTES", "split_min_minutes", 45)
+        )
+        max_depth = int(setting("SAMSARA_SPLIT_MAX_DEPTH", "split_max_depth", 3))
+        if window_minutes < 1 or min_minutes < 1 or max_depth < 0:
+            raise ValueError("Paramètres de découpage invalides")
+        return {
+            "window_minutes": window_minutes,
+            "split_min_minutes": min_minutes,
+            "split_max_depth": max_depth,
+        }
 
     def fetch_and_upload(self, *args, **kwargs):
         """
@@ -148,6 +183,7 @@ class DataFetcher:
         self.endpoint_info["folder_path"] = (
             table if pd.isna(family) else f"{family}/{table}"
         )
+        self.gcs_client.migrate_legacy_table_state(table)
         endpoint_infos = []
 
         # Parse les paramètres de la requête
@@ -284,9 +320,8 @@ class DataFetcher:
 
             # Par défaut, l'intervalle de recupération est de 1 jour
             # on peut le modifier dans les paramètres de l'endpoint et cette valeur qui fait fois si elle existe
-            if pd.isnull(delta_days := self.endpoint_info.get("delta_days")):
-                delta_days = 1
-            delta = timedelta(days=delta_days)
+            split_policy = self._split_policy()
+            delta = timedelta(minutes=split_policy["window_minutes"])
 
             # cette variable uniformise la gestion des dates (startMs, startTime, startDate) en proposant un format standard qui gere les différents cas
             start_end_config = get_start_end_date_config(params)
@@ -294,6 +329,9 @@ class DataFetcher:
                 start_end_type: Literal["datetime", "date", "timestamp_ms"] = (
                     start_end_config.get("type")
                 )
+                if start_end_type == "date" and delta < timedelta(days=1):
+                    # Date-only APIs cannot represent subday windows.
+                    delta = timedelta(days=1)
                 start_date = params.get(start_end_config.get("start_str"))
                 end_date = params.get(start_end_config.get("end_str"))
 
@@ -352,34 +390,53 @@ class DataFetcher:
 
                 # Récupération des données pour les endpoints avec date dans les paramètres
                 date_intervals = []
-                current_date = start_date
-                has_range = current_date < end_date
-                while has_range and current_date < end_date:
-                    day_start = current_date  # .isoformat()
-                    boundary_gap = (
-                        timedelta(seconds=1)
-                        if start_end_type == "date"
-                        else timedelta(milliseconds=1)
+                if start_end_type == "timestamp_ms":
+                    table_name = self.endpoint_info["table_name"]
+                    endpoint = self.endpoint_info["endpoint"]
+                    self.gcs_client.migrate_legacy_extraction_state(
+                        table_name, endpoint, params
                     )
-                    if (
-                        end_date_temp := current_date + delta - boundary_gap
-                    ) > end_date:
-                        day_end = end_date  # .isoformat()
-                        has_range = False
-                    else:
-                        day_end = end_date_temp  # .isoformat()
-
-                    date_intervals.append(
-                        {
-                            start_end_config.get("start_str"): date_to_iso_or_timestamp(
-                                day_start, start_end_type
-                            ),
-                            start_end_config.get("end_str"): date_to_iso_or_timestamp(
-                                day_end, start_end_type
-                            ),
-                        }
+                    manifest = self.gcs_client.get_extraction_manifest(table_name)
+                    signature = request_signature(table_name, endpoint, params)
+                    start_ms = int(params[start_end_config["start_str"]])
+                    end_exclusive_ms = int(params[start_end_config["end_str"]])
+                    window_ms = round(split_policy["window_minutes"] * 60_000)
+                    windows = plan_timestamp_intervals(
+                        start_ms,
+                        end_exclusive_ms,
+                        window_ms,
+                        manifest,
+                        signature,
+                        lambda path: self.gcs_client.bucket_manager.file_exists(path)[0],
                     )
-                    current_date += delta
+                    self.logger.info(
+                        f"{table_name}: {len(windows)} fenêtre(s) à télécharger ou reprendre "
+                        f"avec une fenêtre cible de {split_policy['window_minutes']} minute(s)."
+                    )
+                    date_intervals = [
+                        {"startMs": left, "endMs": right - 1}
+                        for left, right in windows
+                    ]
+                else:
+                    current_date = start_date
+                    while current_date < end_date:
+                        boundary_gap = (
+                            timedelta(seconds=1)
+                            if start_end_type == "date"
+                            else timedelta(milliseconds=1)
+                        )
+                        day_end = min(current_date + delta - boundary_gap, end_date)
+                        date_intervals.append(
+                            {
+                                start_end_config["start_str"]: date_to_iso_or_timestamp(
+                                    current_date, start_end_type
+                                ),
+                                start_end_config["end_str"]: date_to_iso_or_timestamp(
+                                    day_end, start_end_type
+                                ),
+                            }
+                        )
+                        current_date += delta
 
                 # Exécution en parallèle
                 parallelize_execution(
@@ -477,40 +534,73 @@ class DataFetcher:
                 )
 
         except Exception as e:
-            if self._split_gateway_timeout_interval(e, params, file_name, kwargs):
+            if self._split_server_error_interval(e, params, file_name, kwargs):
                 return
             self.logger.error(
                 f"Erreur lors de la récupération pour table : {self.endpoint_info.get('table_name')}, date : {date_str}, params : {params} exception : {e}"
             )
             raise
 
-    def _split_gateway_timeout_interval(
+    def _split_server_error_interval(
         self, error: Exception, params: dict, file_name: str, kwargs: dict
     ) -> bool:
-        """Retry a timed-out legacy query as two non-overlapping time windows."""
-        split_enabled = self.endpoint_info.get("split_on_gateway_timeout")
-        if not pd.notna(split_enabled) or not split_enabled or not _is_gateway_timeout(error):
+        """Split a failed legacy query without replaying any committed chunks."""
+        split_enabled = self.endpoint_info.get("split_on_server_error")
+        if not pd.notna(split_enabled):
+            split_enabled = self.endpoint_info.get("split_on_gateway_timeout")
+        status = _retryable_server_status(error)
+        if not pd.notna(split_enabled) or not split_enabled or status is None:
             return False
+        policy = self._split_policy()
         depth = int(kwargs.get("_split_depth", 0))
         start_ms = int(params["startMs"])
         end_ms = int(params["endMs"])
         duration_ms = end_ms - start_ms + 1
-        if depth >= 2 or duration_ms < 2 * 60 * 60 * 1000:
+        if (depth >= policy["split_max_depth"] or
+                duration_ms // 2 < policy["split_min_minutes"] * 60_000):
             return False
 
         endpoint = self.endpoint_info.get("endpoint")
+        table_name = self.endpoint_info["table_name"]
         identity = f'{self.endpoint_info.get("folder_path")}/{file_name}|{endpoint}'
-        state_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        state = self.gcs_client.get_extraction_manifest().get(state_key, {})
+        signature = request_signature(table_name, endpoint, params)
+        state_key = partition_key(signature, start_ms, end_ms + 1)
+        state = self.gcs_client.get_extraction_manifest(table_name).get(state_key, {})
         if state.get("uploaded_files") or state.get("next_cursor"):
             # A committed chunk must be resumed with its cursor to avoid duplicates.
+            return False
+        # A crash can happen after uploading a chunk but before persisting its
+        # cursor. Do not split the parent while an uncommitted parent file exists:
+        # it would otherwise be loaded alongside the child partitions.
+        prefix = f'{self.endpoint_info["folder_path"]}/{file_name}_'
+        if any(self.gcs_client.bucket_manager.bucket.list_blobs(
+            prefix=prefix, max_results=1
+        )):
+            self.logger.warning(
+                f"Chunk non confirmé détecté pour {identity}; "
+                "la fenêtre d'origine sera retentée sans découpage."
+            )
             return False
 
         middle_ms = start_ms + duration_ms // 2
         if middle_ms <= start_ms or middle_ms > end_ms:
             return False
+        self.gcs_client.update_extraction_state(
+            table_name,
+            state_key,
+            {
+                "identity": identity,
+                "signature": signature,
+                "start_ms": start_ms,
+                "end_exclusive_ms": end_ms + 1,
+                "status": "split",
+                "children": [[start_ms, middle_ms], [middle_ms, end_ms + 1]],
+                "split_policy": policy,
+                "updated_at": datetime.now().isoformat(),
+            },
+        )
         self.logger.warning(
-            f"Samsara a renvoyé 504 pour {self.endpoint_info.get('table_name')} "
+            f"Samsara a renvoyé HTTP {status} pour {self.endpoint_info.get('table_name')} "
             f"[{start_ms}, {end_ms}]. Nouvelle tentative en deux fenêtres: "
             f"[{start_ms}, {middle_ms - 1}] et [{middle_ms}, {end_ms}]."
         )
@@ -577,9 +667,32 @@ class DataFetcher:
         date_str: str,
         max_calls_per_second: int | float,
     ) -> None:
+        table_name = self.endpoint_info["table_name"]
         state_identity = f'{self.endpoint_info.get("folder_path")}/{file_name}|{endpoint}'
-        state_key = hashlib.sha256(state_identity.encode("utf-8")).hexdigest()
-        state = self.gcs_client.get_extraction_manifest().get(state_key, {})
+        signature = request_signature(table_name, endpoint, params)
+        start_ms = int(params["startMs"]) if "startMs" in params else None
+        end_exclusive_ms = int(params["endMs"]) + 1 if "endMs" in params else None
+        state_key = (
+            partition_key(signature, start_ms, end_exclusive_ms)
+            if start_ms is not None and end_exclusive_ms is not None
+            else hashlib.sha256(f"{signature}:{state_identity}".encode()).hexdigest()
+        )
+        manifest = self.gcs_client.get_extraction_manifest(table_name)
+        state = manifest.get(state_key, {})
+        if not (start_ms is not None and end_exclusive_ms is not None) and not state:
+            legacy_key = hashlib.sha256(state_identity.encode()).hexdigest()
+            legacy_state = manifest.get(legacy_key, {})
+            if legacy_state.get("identity") == state_identity:
+                state = legacy_state
+        state_metadata = {
+            "identity": state_identity,
+            "signature": signature,
+            "split_policy": self._split_policy(),
+        }
+        if start_ms is not None and end_exclusive_ms is not None:
+            state_metadata.update(
+                {"start_ms": start_ms, "end_exclusive_ms": end_exclusive_ms}
+            )
         uploaded_files = state.get("uploaded_files", [])
         files_are_present = all(
             self.gcs_client.bucket_manager.file_exists(path)[0]
@@ -596,6 +709,28 @@ class DataFetcher:
         if cursor := state.get("next_cursor"):
             request_params["after"] = cursor
         chunk_index = int(state.get("next_chunk_index", 1))
+        chunk_policy = {
+            "chunk_rows": self.chunk_rows,
+            "chunk_pages": self.chunk_pages,
+        }
+        chunk_policy_history = list(state.get("chunk_policy_history") or [])
+        if not chunk_policy_history or any(
+            chunk_policy_history[-1].get(key) != value
+            for key, value in chunk_policy.items()
+        ):
+            chunk_policy_history.append(
+                {
+                    **chunk_policy,
+                    "from_chunk_index": chunk_index,
+                    "recorded_at": datetime.now().isoformat(),
+                }
+            )
+        state_metadata.update(
+            {
+                "chunk_policy": chunk_policy,
+                "chunk_policy_history": chunk_policy_history,
+            }
+        )
         rows_written = int(state.get("rows_written", 0))
         buffered_rows = []
         next_cursor = state.get("next_cursor")
@@ -639,9 +774,10 @@ class DataFetcher:
                 pages_in_chunk = 0
                 if next_cursor:
                     self.gcs_client.update_extraction_state(
+                        table_name,
                         state_key,
                         {
-                            "identity": state_identity,
+                            **state_metadata,
                             "status": "in_progress",
                             "next_cursor": next_cursor,
                             "next_chunk_index": chunk_index,
@@ -663,9 +799,10 @@ class DataFetcher:
             chunk_index += 1
 
         self.gcs_client.update_extraction_state(
+            table_name,
             state_key,
             {
-                "identity": state_identity,
+                **state_metadata,
                 "status": "complete",
                 "next_cursor": None,
                 "next_chunk_index": chunk_index,

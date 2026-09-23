@@ -103,6 +103,21 @@ class TransformData:
         :param table_name: nom de la table
         :return: dict[str, pd.DataFrame]
         """
+        if table_name == "fleet_assets_reefers":
+            # The Samsara payload uses lower camel case (``reeferStats_*``),
+            # while the historical BigQuery child-table names use
+            # ``ReeferStats_*``. Normalize only the source columns so both
+            # current API files and legacy files remain supported.
+            rename_columns = {}
+            for column in df.columns:
+                if not column.startswith("reeferStats_"):
+                    continue
+                canonical = f"ReeferStats_{column.removeprefix('reeferStats_')}"
+                if canonical not in df.columns:
+                    rename_columns[column] = canonical
+            if rename_columns:
+                df = df.rename(columns=rename_columns)
+
         if table_name in self.tables_to_split:
             results: dict[str, pd.DataFrame] = self.set_data(df, {"table_name": f"{table_name}_split"}).transform()
             for table_name in results:

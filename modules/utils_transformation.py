@@ -185,18 +185,34 @@ def split_dataframe(
     :return: dict[str, pd.DataFrame]
     """
     result = {}
-    for shared_col in shared_cols:
-        if shared_col not in df.columns:
-            shared_cols.remove(shared_col)
+    available_shared = [col for col in shared_cols if col in df.columns]
+
+    def has_payload(value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, dict):
+            return bool(value)
+        if isinstance(value, (list, tuple, np.ndarray)):
+            return any(has_payload(item) for item in value)
+        return not bool(pd.isna(value))
+
     for table_name, configs in split_configs.items():
         if prefix := configs.get("prefix"):
             columns = [col for col in df.columns if col.startswith(prefix)]
         else:
-            columns = configs.get("columns", [])
-            for col in columns:
-                if col not in df.columns:
-                    columns.remove(col)
-        result[table_name] = df.loc[:, shared_cols + columns].copy()
+            columns = [
+                col for col in configs.get("columns", []) if col in df.columns
+            ]
+        if not columns:
+            # This source chunk has no records for this child table. Other
+            # chunks may still provide the column and define its final schema.
+            result[table_name] = pd.DataFrame(columns=available_shared)
+            continue
+        selected = df.loc[:, list(dict.fromkeys([*available_shared, *columns]))].copy()
+        has_data = selected[columns].apply(
+            lambda series: series.map(has_payload)
+        ).any(axis=1)
+        result[table_name] = selected.loc[has_data].copy()
         if configs.get("drop_duplicates", False):
             result[table_name] = result[table_name].drop_duplicates(
                 subset=configs.get("subset", None)

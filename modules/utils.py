@@ -398,4 +398,5 @@ LOGS_DIR = make_path(os.path.join(RESSOURCES_DIR, "logs"))
 DATA_DIR = make_path(os.path.join(RESSOURCES_DIR, "data"))
 CREDENTIALS_DIR = make_path(os.path.join(ROOT_PATH, "credentials"))
 DEFAULT_RATE_LIMIT_SECOND = 5
+MAX_RETRIES_REQUEST = 3
 DEFAULT_START_DATE = "13/07/2020"

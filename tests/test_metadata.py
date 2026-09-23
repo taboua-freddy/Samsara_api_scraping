@@ -35,6 +35,36 @@ class BuildMetadataTests(unittest.TestCase):
             starts, {"first": "10/01/2025", "second": "01/01/2025"}
         )
 
+    def test_historical_range_ignores_the_incremental_checkpoint(self):
+        def fake_metadata(start_time, end_time, metadata_filename=None):
+            return pd.DataFrame(
+                [
+                    {
+                        "table_name": "first",
+                        "download_type": DownloadType.TIME.value,
+                        "params": f"start={start_time},end={end_time}",
+                    }
+                ]
+            )
+
+        with patch.object(metadata_module, "make_meta_data", fake_metadata):
+            result = metadata_module.build_metadata(
+                configs_for_update={
+                    "first": {
+                        "download_type": DownloadType.TIME.value,
+                        ColumnToUpdate.DOWNLOAD.value: "19/09/2026",
+                    }
+                },
+                table_names=["first"],
+                start_date="18/09/2026",
+                end_date="20/09/2026",
+                use_configured_start=False,
+            )
+
+        row = result.iloc[0]
+        self.assertEqual(row[ColumnToUpdate.DOWNLOAD.value], "18/09/2026")
+        self.assertEqual(row["params"], "start=18/09/2026,end=20/09/2026")
+
 
 class MetadataValidationTests(unittest.TestCase):
     def test_rejects_duplicate_table_names(self):
@@ -90,9 +120,9 @@ class MetadataValidationTests(unittest.TestCase):
         self.assertEqual(alerts_config["table_column_name"], "id")
         self.assertIn("configurationId", alerts_config["table_column_aliases"])
 
-    def test_reefer_endpoint_uses_short_windows_and_504_fallback(self):
+    def test_reefer_endpoint_uses_short_windows_and_server_error_fallback(self):
         frame = metadata_module.make_meta_data("21/09/2026", "22/09/2026")
         reefer = frame.set_index("table_name").loc["fleet_assets_reefers"]
 
         self.assertEqual(reefer["delta_days"], 0.25)
-        self.assertIs(reefer["split_on_gateway_timeout"], True)
+        self.assertIs(reefer["split_on_server_error"], True)
