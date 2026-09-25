@@ -11,12 +11,13 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from itertools import count
 from typing import Callable
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from google.api_core.exceptions import Conflict, PreconditionFailed
+from google.api_core.exceptions import Conflict, PreconditionFailed, TooManyRequests
 from google.cloud import bigquery, storage
 from google.cloud.exceptions import NotFound
 from google.resumable_media.common import InvalidResponse
@@ -76,6 +77,15 @@ def _is_generation_conflict(exc: Exception) -> bool:
         return True
     response = getattr(exc, "response", None)
     return isinstance(exc, InvalidResponse) and getattr(response, "status_code", None) == 412
+
+
+def _is_retryable_table_rate_error(exc: Exception) -> bool:
+    """Only retry transient BigQuery table-write throttling, not bad schemas."""
+    message = str(exc)
+    return isinstance(exc, TooManyRequests) or (
+        "rateLimitExceeded" in message
+        and "table" in message.lower()
+    ) or "too many table update operations" in message.lower()
 
 
 class ExecutionLock:
@@ -537,6 +547,30 @@ class BigQueryManager:
             "partition_expiration_days", 365 * 4
         )  # Durée de conservation des partitions
         self.partition_expiration_ms = int(timedelta(days=self.partition_expiration_days).total_seconds() * 1000)
+        self.table_load_min_interval_seconds = float(
+            os.getenv("BIGQUERY_TABLE_LOAD_MIN_INTERVAL_SECONDS", "2.5")
+        )
+        if self.table_load_min_interval_seconds < 0:
+            raise ValueError("BIGQUERY_TABLE_LOAD_MIN_INTERVAL_SECONDS doit être positif ou nul")
+        self.table_load_max_attempts = int(
+            os.getenv("BIGQUERY_TABLE_LOAD_MAX_ATTEMPTS", "5")
+        )
+        if self.table_load_max_attempts < 1:
+            raise ValueError("BIGQUERY_TABLE_LOAD_MAX_ATTEMPTS doit être supérieur ou égal à 1")
+        self._table_load_lock = threading.Lock()
+        self._table_load_next_at: dict[str, float] = {}
+
+    def _pace_table_load(self, table_name: str) -> None:
+        """Reserve a per-table submission slot without blocking other tables."""
+        interval = getattr(self, "table_load_min_interval_seconds", 0.0)
+        if interval <= 0:
+            return
+        with self._table_load_lock:
+            now = time.monotonic()
+            slot = max(now, self._table_load_next_at.get(table_name, now))
+            self._table_load_next_at[table_name] = slot + interval
+        if slot > now:
+            time.sleep(slot - now)
 
     def load_parquet_to_bigquery(
             self, uri: str | list[str], table_name: str, job_id: str | None = None
@@ -633,33 +667,84 @@ class BigQueryManager:
             **extra_config,
         )
 
-        # Charger le fichier Parquet dans BigQuery
+        # A successful deterministic job is reusable; a failed 429 job is
+        # immutable, so its retry needs a fresh deterministic attempt ID.
         self.logger.info(
             f"Loading files into BigQuery table '{table_name}' from URIs: {uri}"
         )
-        try:
-            try:
-                load_job = self.bigquery_client.load_table_from_uri(
-                    uri, table_id, job_config=job_config, job_id=job_id
-                )
-            except Conflict:
-                if not job_id:
-                    raise
-                self.logger.info(
-                    f"Le job BigQuery {job_id} existe déjà, récupération du résultat."
-                )
-                load_job = self.bigquery_client.get_job(job_id)
-            result = load_job.result()
-            if load_job.errors:
-                raise RuntimeError(
-                    f"Erreurs BigQuery pour la table '{table_name}': {load_job.errors}"
-                )
-            self.logger.info(
-                f"Table '{table_name}' mise à jour avec succès depuis {uri}."
+        max_attempts = getattr(self, "table_load_max_attempts", 5)
+        new_attempts = 0
+        last_error: Exception | None = None
+        for retry_index in count():
+            attempt_id = (
+                job_id if retry_index == 0 or job_id is None
+                else f"{job_id}_retry_{retry_index}"
             )
-            return (uri, result)
-        except Exception as e:
-            return (uri, e)
+            load_job = None
+            newly_submitted = False
+            if attempt_id is not None:
+                try:
+                    load_job = self.bigquery_client.get_job(attempt_id)
+                except NotFound:
+                    pass
+                except Exception as exc:
+                    return (uri, exc)
+
+            if load_job is None:
+                if new_attempts >= max_attempts:
+                    break
+                self._pace_table_load(table_name)
+                new_attempts += 1
+                try:
+                    load_job = self.bigquery_client.load_table_from_uri(
+                        uri, table_id, job_config=job_config, job_id=attempt_id
+                    )
+                    newly_submitted = True
+                except Conflict as exc:
+                    if attempt_id is None:
+                        return (uri, exc)
+                    self.logger.info(
+                        f"Le job BigQuery {attempt_id} existe déjà, récupération du résultat."
+                    )
+                    try:
+                        load_job = self.bigquery_client.get_job(attempt_id)
+                    except Exception as exc:
+                        return (uri, exc)
+                except Exception as exc:
+                    last_error = exc
+                    if not _is_retryable_table_rate_error(exc):
+                        return (uri, exc)
+                    if new_attempts < max_attempts:
+                        time.sleep(min(30, 2 ** new_attempts) + random.uniform(0, 0.5))
+                    continue
+            else:
+                self.logger.info(
+                    f"Le job BigQuery {attempt_id} existe déjà, récupération du résultat."
+                )
+
+            try:
+                result = load_job.result()
+                if load_job.errors:
+                    raise RuntimeError(
+                        f"Erreurs BigQuery pour la table '{table_name}': {load_job.errors}"
+                    )
+                self.logger.info(
+                    f"Table '{table_name}' mise à jour avec succès depuis {uri}."
+                )
+                return (uri, result)
+            except Exception as exc:
+                last_error = exc
+                if not _is_retryable_table_rate_error(exc):
+                    return (uri, exc)
+                self.logger.warning(
+                    f"Job BigQuery limité pour {table_name} ({attempt_id}): {exc}"
+                )
+                if newly_submitted and new_attempts < max_attempts:
+                    time.sleep(min(30, 2 ** new_attempts) + random.uniform(0, 0.5))
+
+        return (uri, last_error or RuntimeError(
+            f"Trop de jobs BigQuery déjà échoués pour {table_name}"
+        ))
 
     def get_table_schema(self, table_name: str) -> list[bigquery.SchemaField] | None:
         """
@@ -1470,8 +1555,10 @@ class GCSBigQueryLoader:
                     self.logger.info(f"[ok] Job soumis à bigquery pour {uri}")
                     manifest_entry = future_entries[future]
                     successful_manifest_entries[manifest_entry["fingerprint"]] = manifest_entry["entry"]
-        if failures:
-            raise RuntimeError(
-                f"{len(failures)} chargement(s) BigQuery ont échoué"
-            ) from failures[0][1]
         self.gcs_client.update_bigquery_load_manifest(successful_manifest_entries)
+        if failures:
+            first_uri, first_error = failures[0]
+            raise RuntimeError(
+                f"{len(failures)} chargement(s) BigQuery ont échoué. "
+                f"Premier échec: {first_uri}: {first_error}"
+            ) from first_error

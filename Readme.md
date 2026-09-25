@@ -86,7 +86,7 @@ Après validation du plan, retirer `--dry-run`. L'option `--table` peut être r�
 - `--end_date` : Date de fin (format `jj/mm/aaaa`).
 - `--max_workers` : Nombre de requêtes à traiter en parallèle.
 - `--table_file_path` : Chemin du fichier contenant les noms des tables à traiter. Utiliser `ALL` pour toutes les tables. Vous pouvez avoir la liste des tables prises en charge dans le fichier `modules/metadata.py`.
-- `--default-tables` : Traite explicitement l'union des catégories `ev`, `time`, `stats` et `core` de `get_table_name_by_category()` ; cette sélection est plus restreinte que `--table_file_path ALL` et ne se combine pas avec les autres sélections de tables.
+- `--default-tables` : Traite explicitement l'union des catégories actuellement renvoyées par `get_table_name_by_category()` ; cette sélection est plus restreinte que `--table_file_path ALL` et ne se combine pas avec les autres sélections de tables.
 - `--table` : Nom exact d'une table à traiter ; répétable.
 - `--stages` : Sous-ensemble ordonné de `download`, `transform` et `load`.
 - `--dry-run` : Validation locale du plan sans appel externe ni écriture cloud.
@@ -113,7 +113,7 @@ python -m unittest discover -s tests -v
 ruff check main.py modules scripts tests
 ```
 
-Les erreurs d'extraction, d'upload, de transformation ou de chargement BigQuery interrompent désormais l'exécution. Les checkpoints ne sont mis à jour qu'après la réussite complète de l'étape correspondante.
+Les erreurs d'extraction, d'upload, de transformation ou de chargement BigQuery interrompent l'exécution. Lors d'un chargement BigQuery partiellement réussi, les fichiers chargés sont enregistrés dans le manifeste avant de signaler les échecs ; une reprise ne recharge donc que les fichiers manquants. Les soumissions vers une même table sont espacées pour éviter le quota de mises à jour, et un job échoué sur une erreur de quota temporaire est relancé sous un nouvel identifiant. Les checkpoints des autres étapes ne sont mis à jour qu'après leur réussite complète.
 
 Les chargements BigQuery utilisent également un manifeste stocké dans le bucket aplati (`resources/configs/bigquery_load_manifest.json`) et des identifiants de jobs déterministes. Une relance peut ainsi reprendre un job existant sans ajouter une seconde fois les mêmes fichiers temporels. Les mises à jour des fichiers de configuration utilisent les générations GCS afin de détecter les écritures concurrentes.
 

@@ -180,6 +180,27 @@ class StreamingExtractionTests(unittest.TestCase):
         for previous, following in zip(windows, windows[1:], strict=False):
             self.assertEqual(previous["endMs"] + 1, following["startMs"])
 
+    def test_empty_timestamp_window_after_checkpoint_is_skipped(self):
+        fetcher, client, gcs_client = self.make_fetcher()
+        client.shared_vars_manager = None
+        fetcher.endpoint_info.update({
+            "family": "assets",
+            "table_name": "fleet_assets_reefers",
+            "endpoint": "v1/fleet/assets/reefers",
+            "params": "startMs=1790114400000,endMs=1790114400000",
+            "is_exception": False,
+            "exception_config": {},
+            "delta_days": 0.25,
+            "rate_limit_per_seconde": 5,
+        })
+
+        with patch("modules.processing.parallelize_execution") as parallel:
+            fetcher.fetch_and_upload()
+
+        parallel.assert_not_called()
+        client.iter_data_pages.assert_not_called()
+        gcs_client.get_extraction_manifest.assert_not_called()
+
     def test_changed_window_resumes_original_partial_partition(self):
         fetcher, client, gcs_client = self.make_fetcher()
         client.shared_vars_manager = None

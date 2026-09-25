@@ -1,6 +1,6 @@
-import threading
-import json
 import io
+import json
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,24 +9,138 @@ from unittest.mock import Mock, patch
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from google.api_core.exceptions import Conflict
+from google.api_core.exceptions import Conflict, TooManyRequests
 from google.cloud import bigquery
+from google.cloud.exceptions import NotFound
 from google.resumable_media.common import InvalidResponse
 
+from modules.extraction_manifest import partition_key, request_signature
 from modules.gcp import (
     BigQueryManager,
     BucketManager,
     ExecutionLock,
-    GCSClient,
     GCSBigQueryLoader,
+    GCSClient,
     build_load_fingerprint,
     current_oneshot_files,
 )
-from modules.extraction_manifest import partition_key, request_signature
 from modules.interface import SearchRetrieveType
 
 
 class BigQueryManagerTests(unittest.TestCase):
+    def test_reuses_an_existing_successful_job_without_resubmitting(self):
+        successful_job = Mock(errors=None)
+        successful_job.result.return_value = successful_job
+        client = Mock(project="project")
+        client.get_job.return_value = successful_job
+        manager = BigQueryManager.__new__(BigQueryManager)
+        manager.bigquery_client = client
+        manager.dataset_id = "dataset"
+        manager.logger = Mock()
+        manager.memory_manager = None
+
+        _, result = manager.load_parquet_to_bigquery(
+            "gs://bucket/file.parquet", "table", job_id="stable-job"
+        )
+
+        self.assertIs(result, successful_job)
+        client.load_table_from_uri.assert_not_called()
+
+    def test_retries_an_existing_failed_rate_limited_job_with_new_id(self):
+        failed_job = Mock()
+        failed_job.result.side_effect = TooManyRequests(
+            "Exceeded rate limits: too many table update operations for this table"
+        )
+        successful_job = Mock(errors=None)
+        successful_job.result.return_value = successful_job
+        client = Mock(project="project")
+        client.get_job.side_effect = [failed_job, NotFound("job absent")]
+        client.load_table_from_uri.return_value = successful_job
+        manager = BigQueryManager.__new__(BigQueryManager)
+        manager.bigquery_client = client
+        manager.dataset_id = "dataset"
+        manager.logger = Mock()
+        manager.memory_manager = None
+        manager.table_load_min_interval_seconds = 0
+        manager.table_load_max_attempts = 2
+
+        _, result = manager.load_parquet_to_bigquery(
+            "gs://bucket/file.parquet", "table", job_id="stable-job"
+        )
+
+        self.assertIs(result, successful_job)
+        self.assertEqual(
+            client.load_table_from_uri.call_args.kwargs["job_id"],
+            "stable-job_retry_1",
+        )
+        self.assertEqual(client.get_job.call_count, 2)
+
+    def test_does_not_retry_a_permanent_load_error(self):
+        failed_job = Mock(errors=[{"reason": "invalid"}])
+        failed_job.result.side_effect = ValueError("invalid schema")
+        client = Mock(project="project")
+        client.get_job.side_effect = NotFound("job absent")
+        client.load_table_from_uri.return_value = failed_job
+        manager = BigQueryManager.__new__(BigQueryManager)
+        manager.bigquery_client = client
+        manager.dataset_id = "dataset"
+        manager.logger = Mock()
+        manager.memory_manager = None
+        manager.table_load_min_interval_seconds = 0
+        manager.table_load_max_attempts = 5
+
+        _, result = manager.load_parquet_to_bigquery(
+            "gs://bucket/file.parquet", "table", job_id="stable-job"
+        )
+
+        self.assertIsInstance(result, ValueError)
+        client.load_table_from_uri.assert_called_once()
+
+    def test_rate_limited_new_job_gets_a_new_attempt_id(self):
+        failed_job = Mock()
+        failed_job.result.side_effect = TooManyRequests(
+            "Exceeded rate limits: too many table update operations for this table"
+        )
+        successful_job = Mock(errors=None)
+        successful_job.result.return_value = successful_job
+        client = Mock(project="project")
+        client.get_job.side_effect = NotFound("job absent")
+        client.load_table_from_uri.side_effect = [failed_job, successful_job]
+        manager = BigQueryManager.__new__(BigQueryManager)
+        manager.bigquery_client = client
+        manager.dataset_id = "dataset"
+        manager.logger = Mock()
+        manager.memory_manager = None
+        manager.table_load_min_interval_seconds = 0
+        manager.table_load_max_attempts = 2
+
+        with patch("modules.gcp.time.sleep"):
+            _, result = manager.load_parquet_to_bigquery(
+                "gs://bucket/file.parquet", "table", job_id="stable-job"
+            )
+
+        self.assertIs(result, successful_job)
+        self.assertEqual(
+            [call.kwargs["job_id"] for call in client.load_table_from_uri.call_args_list],
+            ["stable-job", "stable-job_retry_1"],
+        )
+
+    def test_spaces_new_jobs_for_the_same_table(self):
+        manager = BigQueryManager.__new__(BigQueryManager)
+        manager.table_load_min_interval_seconds = 2.5
+        manager._table_load_lock = threading.Lock()
+        manager._table_load_next_at = {}
+
+        with (
+            patch("modules.gcp.time.monotonic", return_value=10.0),
+            patch("modules.gcp.time.sleep") as sleep,
+        ):
+            manager._pace_table_load("same_table")
+            manager._pace_table_load("same_table")
+            manager._pace_table_load("other_table")
+
+        sleep.assert_called_once_with(2.5)
+
     def test_oneshot_batch_uses_single_truncate_job(self):
         load_job = Mock(errors=None)
         load_job.result.return_value = load_job
@@ -361,6 +475,47 @@ class OneshotLoadTests(unittest.TestCase):
         self.assertEqual(uris, [f"gs://flat-bucket/{name}" for name in names[1:]])
         manifest_entry = next(iter(loader.gcs_client.update_bigquery_load_manifest.call_args.args[0].values()))
         self.assertEqual(manifest_entry["uris"], uris)
+
+
+class PartialLoadManifestTests(unittest.TestCase):
+    def test_persists_successful_loads_before_reporting_failures(self):
+        loader = GCSBigQueryLoader.__new__(GCSBigQueryLoader)
+        loader.bucket_name = "flat-bucket"
+        loader.bucket_manager = Mock()
+        loader.bucket_manager.list_parquet_file_metadata.return_value = [
+            {"name": "stats/time_table/time_table_2026_09_22_00001.parquet", "generation": "1"},
+            {"name": "stats/time_table/time_table_2026_09_22_00002.parquet", "generation": "2"},
+        ]
+        loader.bucket_manager.get_table_name.return_value = "time_table"
+        loader.bucket_manager.get_start_date.return_value = None
+        loader.bucket_manager.get_end_date.return_value = None
+        loader.gcs_client = Mock()
+        loader.gcs_client.get_bigquery_load_manifest.return_value = {}
+        loader.bigquery_manager = Mock()
+        loader.bigquery_manager.load_parquet_to_bigquery.side_effect = (
+            lambda uri, table_name, job_id: (
+                uri,
+                TooManyRequests("rateLimitExceeded: table.write")
+                if "00001" in uri else Mock(),
+            )
+        )
+        loader.logger = Mock()
+        loader._from = None
+        loader._to = None
+        loader.max_workers = 1
+
+        with self.assertRaisesRegex(RuntimeError, "1 chargement\\(s\\)"):
+            loader.run(
+                configs_for_update={},
+                metadata=pd.DataFrame([{
+                    "family": "stats", "table_name": "time_table",
+                    "download_type": "time",
+                }]),
+            )
+
+        entries = loader.gcs_client.update_bigquery_load_manifest.call_args.args[0]
+        self.assertEqual(len(entries), 1)
+        self.assertIn("00002.parquet", next(iter(entries.values()))["uri"])
 
 
 class ExtractionManifestStorageTests(unittest.TestCase):

@@ -395,13 +395,19 @@ class DataFetcher:
                 if start_end_type == "timestamp_ms":
                     table_name = self.endpoint_info["table_name"]
                     endpoint = self.endpoint_info["endpoint"]
+                    start_ms = int(params[start_end_config["start_str"]])
+                    end_exclusive_ms = int(params[start_end_config["end_str"]])
+                    if start_ms >= end_exclusive_ms:
+                        self.logger.info(
+                            f"{table_name}: aucune fenêtre à télécharger "
+                            f"(début={start_ms}, fin exclusive={end_exclusive_ms})."
+                        )
+                        continue
                     self.gcs_client.migrate_legacy_extraction_state(
                         table_name, endpoint, params
                     )
                     manifest = self.gcs_client.get_extraction_manifest(table_name)
                     signature = request_signature(table_name, endpoint, params)
-                    start_ms = int(params[start_end_config["start_str"]])
-                    end_exclusive_ms = int(params[start_end_config["end_str"]])
                     window_ms = round(split_policy["window_minutes"] * 60_000)
                     windows = plan_timestamp_intervals(
                         start_ms,

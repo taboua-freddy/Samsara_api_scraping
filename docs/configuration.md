@@ -33,6 +33,8 @@ Les variables suivantes sont lues par `main.py`, `modules/processing.py` ou `mod
 | `SAMSARA_SPLIT_MAX_DEPTH` | `3`, entier ≥ 0 | Nombre maximal de subdivisions récursives ; `0` désactive la subdivision, même si `split_on_server_error` est vrai. Remplace `split_max_depth`. |
 | `PARALLEL_PROGRESS_INTERVAL_SECONDS` | `60`, nombre de secondes | Intervalle entre deux messages « toujours en cours » quand aucune tâche parallèle ne finit. Une valeur ≤ 0 revient à 60 s. N'agit pas sur la fréquence des appels API. |
 | `BIGQUERY_MANIFEST_RETENTION_DAYS` | `30`, entier ≥ 0 | Nettoyage du manifeste **BigQuery** après la réussite des étapes : retire seulement les entrées devenues sûres à oublier (voir README). Ne supprime ni les fichiers de données ni les manifestes d'extraction par table. `0` ne signifie pas « tout supprimer ». |
+| `BIGQUERY_TABLE_LOAD_MIN_INTERVAL_SECONDS` | `2.5`, nombre ≥ 0 | Intervalle minimal entre deux nouveaux jobs de chargement vers une même table BigQuery. Les jobs déjà terminés retrouvés par leur ID ne sont pas ralentis. `0` désactive le rythme, à réserver aux tests. |
+| `BIGQUERY_TABLE_LOAD_MAX_ATTEMPTS` | `5`, entier ≥ 1 | Nombre maximal de nouveaux jobs tentés pour un fichier lorsque BigQuery renvoie une erreur transitoire de quota de table. Les jobs déjà échoués retrouvés par leur ID sont inspectés sans être resoumis. |
 | `LOG_RETENTION_DAYS` | `30`, entier ≥ 1 | Supprime après la réussite des étapes les anciens logs locaux et les logs du bucket brut. |
 | `PIPELINE_LOCK_TTL_MINUTES` | `1440`, entier ≥ 1 | Durée de vie du verrou GCS qui empêche deux exécutions simultanées. Le verrou est libéré à la fin normale ; un TTL trop court peut laisser démarrer un second Job pendant le premier. |
 
@@ -113,7 +115,7 @@ Par exemple, pour cette seule table, ajouter `"window_minutes": 180` dans l'obje
 | `--lookback-days N` | Fenêtre de `N` jours se terminant aujourd'hui (`N ≥ 1`) ; incompatible avec `--start_date` et `--end_date`. |
 | `--table NOM` | Table précise ; répétable. Prioritaire sur les autres sélections de tables. |
 | `--table_file_path ALL` ou chemin Excel | `ALL` prend les 51 tables du catalogue ; sinon la première colonne du fichier Excel est lue. Ignoré si `--table` est fourni. |
-| `--default-tables` | Sélectionne explicitement toutes les tables renvoyées par `get_table_name_by_category()` (`ev`, `time`, `stats`, `core`), sans inclure les autres tables du catalogue. Incompatible avec `--table`, `--table_file_path` et `--table_cat`. |
+| `--default-tables` | Sélectionne explicitement toutes les tables des catégories actuellement renvoyées par `get_table_name_by_category()` (ici `ev`, `time` et `stats`), sans inclure les autres tables du catalogue. Incompatible avec `--table`, `--table_file_path` et `--table_cat`. |
 | `--table_cat CATEGORIE` | Groupe `ev`, `time`, `stats` ou `core`, si aucune sélection plus prioritaire. Sans catégorie reconnue, la liste par défaut est utilisée. Sert aussi de version dans le chemin des logs GCS. |
 | `--max_workers N` | Concurrence des appels de téléchargement (`N ≥ 1`). Sans valeur : comportement automatique du pool Python. N'augmente pas la limite API autorisée. |
 | `--stages ...` | Choisir parmi `download transform load` ; les trois étapes sont exécutées par défaut. Permet par exemple `--stages transform load` sans retélécharger. |
@@ -145,11 +147,11 @@ Dans `cloudbuild.yaml`, les substitutions suivantes sont modifiables :
 
 `${PROJECT_ID}` et `${COMMIT_SHA}` sont fournis par Cloud Build ; le secret lui-même n'est pas une substitution en clair.
 
-Le même fichier fixe actuellement `--tasks=1`, `--max-retries=1`, `--task-timeout=24h`, `--cpu=8`, `--memory=16Gi`, les variables injectées par `--set-env-vars`, le jeton par `--set-secrets` et les arguments par `--args=--lookback-days=1,--table_file_path=ALL`. Son `timeout: 1800s` limite **la construction et le déploiement Cloud Build**, pas l'exécution de 24 h du Job. Modifier ces valeurs dans le dépôt ne change le Job qu'après un nouveau déploiement. Le script PowerShell de déploiement possède ses propres valeurs (`2` CPU, `4Gi`) : ce sont deux chemins de déploiement distincts.
+Le même fichier fixe actuellement `--tasks=1`, `--max-retries=1`, `--task-timeout=24h`, `--cpu=8`, `--memory=16Gi`, les variables injectées par `--set-env-vars`, le jeton par `--set-secrets` et les arguments par `--args=--lookback-days=1,--default-tables`. Son `timeout: 1800s` limite **la construction et le déploiement Cloud Build**, pas l'exécution de 24 h du Job. Modifier ces valeurs dans le dépôt ne change le Job qu'après un nouveau déploiement. Le script PowerShell de déploiement possède ses propres valeurs (`2` CPU, `4Gi`) : ce sont deux chemins de déploiement distincts.
 
-Pour que le Job Cloud Run utilise uniquement les catégories par défaut, remplacer son argument `--table_file_path=ALL` par `--default-tables` dans `cloudbuild.yaml`, puis redéployer. Le présent changement de code ne modifie pas automatiquement les arguments du Job existant.
+`cloudbuild.yaml` sélectionne déjà les catégories par défaut. Un Job Cloud Run déployé précédemment garde ses anciens arguments jusqu'au prochain déploiement.
 
-`cloudbuild.yaml` et le script PowerShell injectent actuellement `SAMSARA_CHUNK_ROWS=50000` et `SAMSARA_CHUNK_PAGES=25` au niveau du Job. Pour que les valeurs `chunk_rows`/`chunk_pages` propres aux tables prennent effet dans Cloud Run, retirer ces deux variables globales de `--set-env-vars` ou les ajuster volontairement : elles ont toujours priorité.
+`cloudbuild.yaml` injecte actuellement `SAMSARA_CHUNK_ROWS=100000` et `SAMSARA_CHUNK_PAGES=100`, tandis que le script PowerShell injecte `50000` et `25`. Pour que les valeurs `chunk_rows`/`chunk_pages` propres aux tables prennent effet dans Cloud Run, retirer ces deux variables globales de `--set-env-vars` ou les ajuster volontairement : elles ont toujours priorité. Les nouveaux paramètres `BIGQUERY_TABLE_LOAD_*` utilisent leurs valeurs par défaut dans les deux modes de déploiement si aucune variable n'est injectée.
 
 Le script PowerShell accepte `-ProjectId`, `-Region`, `-Repository`, `-ServiceAccount`, `-RawBucket`, `-FlattenedBucket`, `-DatasetId` (obligatoires), puis `-JobName`, `-SecretName`, `-LookbackDays` (défauts `samsara-pipeline-test`, `samsara-api-token-test`, `1`). `-Apply` réalise le déploiement au lieu d'afficher les commandes ; `-AllowProduction` retire le garde-fou exigeant `test` dans les noms des ressources. À utiliser avec prudence.
 
